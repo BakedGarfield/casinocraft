@@ -556,7 +556,7 @@ public final class CasinoCraft implements ModInitializer {
                 button(12,Items.PAPER,"2 gelijk: symbolen betalen 1-5x","noop");
                 int[] reel=slotSpins.containsKey(viewer)?slotSpins.get(viewer).symbols:new int[]{0,2,1};
                 for(int i=0;i<3;i++)button(21+i,SLOT_ITEMS[reel[i]],"Rol "+(i+1)+": "+SLOT_LABELS[reel[i]],"noop");
-                button(39,Items.RED_STAINED_GLASS_PANE,"Inzet: 1 diamond","bet1");
+                button(39,Blocks.WOOL.red().asItem(),"Inzet: 1 diamond","bet1");
                 button(40,Items.GOLD_INGOT,"Inzet: 5 diamonds","bet5");
                 button(41,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
                 button(42,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
@@ -569,12 +569,12 @@ public final class CasinoCraft implements ModInitializer {
                 for(int index=from;index<to;index++) {
                     int n=EUROPEAN_WHEEL[index];
                     int slot=index-from;
-                    button(slot,n==0?Items.EMERALD_BLOCK:RED_NUMBERS.contains(n)?Items.RED_WOOL:Items.BLACK_WOOL,
+                    button(slot,n==0?Items.EMERALD_BLOCK:RED_NUMBERS.contains(n)?Blocks.WOOL.red().asItem():Blocks.WOOL.black().asItem(),
                         "Wielpositie "+(index+1)+": "+n+" ("+rouletteColor(n)+", 36x)","rn"+n);
                 }
-                button(18,Items.RED_WOOL,"ROOD - 2x","rred");button(19,Items.BLACK_WOOL,"ZWART - 2x","rblack");
+                button(18,Blocks.WOOL.red().asItem(),"ROOD - 2x","rred");button(19,Blocks.WOOL.black().asItem(),"ZWART - 2x","rblack");
                 button(20,Items.IRON_INGOT,"EVEN - 2x","reven");button(21,Items.GOLD_INGOT,"ONEVEN - 2x","rodd");
-                button(22,Items.LIME_DYE,"1-18 - 2x","rlow");button(23,Items.BLUE_DYE,"19-36 - 2x","rhigh");
+                button(22,Items.SLIME_BALL,"1-18 - 2x","rlow");button(23,Items.LAPIS_LAZULI,"19-36 - 2x","rhigh");
                 button(24,Items.PAPER,"Dozijn 1 (3x)","rdozen1");button(25,Items.PAPER,"Dozijn 2 (3x)","rdozen2");button(26,Items.PAPER,"Dozijn 3 (3x)","rdozen3");
                 button(27,Items.PAPER,"Kolom 1 (3x)","rcolumn1");button(28,Items.PAPER,"Kolom 2 (3x)","rcolumn2");button(29,Items.PAPER,"Kolom 3 (3x)","rcolumn3");
                 button(30,Items.ARROW,page==0?"Volgende wielhelft":"Vorige wielhelft","page");
@@ -586,7 +586,7 @@ public final class CasinoCraft implements ModInitializer {
                 button(40,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
                 button(41,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
                 button(42,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
-                button(49,Items.GREEN_CONCRETE,"Klik inzetvak om "+session.stake+" diamonds te plaatsen","noop");
+                button(49,Blocks.CONCRETE.green().asItem(),"Klik inzetvak om "+session.stake+" diamonds te plaatsen","noop");
                 button(50,Items.CLOCK,"Volgende ronde automatisch","noop");
             } else if(session.type.equals("horse")) {
                 button(4,Items.SADDLE,"PAARDENRACE - Kies een paard","noop");
@@ -603,15 +603,15 @@ public final class CasinoCraft implements ModInitializer {
                 button(42,Items.DIAMOND,"Inzet 10 diamonds","bet10");
                 button(43,Items.DIAMOND_BLOCK,"Inzet 32 diamonds","bet32");
                 button(44,Items.EMERALD_BLOCK,"Inzet 64 diamonds","bet64");
-                button(49,Items.LIME_CONCRETE,"BEVESTIG "+session.stake+" diamonds op "+NAMES[session.selected],"place");
+                button(49,Blocks.CONCRETE.lime().asItem(),"BEVESTIG "+session.stake+" diamonds op "+NAMES[session.selected],"place");
                 button(51,Items.CLOCK,raceTicks>=0?"Race bezig":countdown<0?"Wacht op eerste inzet":"Start over "+countdown+" seconden","noop");
             } else if(session.type.equals("blackjack")) {
                 button(4,Items.BOOK,"BLACKJACK - Probeer dichter bij 21 te komen dan de dealer","noop");
                 if(session.rounds>0) {
                     button(20,Items.PAPER,"Jouw kaarten: "+session.value,"noop");
                     button(24,Items.PAPER,"Dealer toont: "+session.dealer,"noop");
-                    button(39,Items.LIME_CONCRETE,"HIT - nieuwe kaart","hit");
-                    button(41,Items.RED_CONCRETE,"STAND - dealer speelt uit","stand");
+                    button(39,Blocks.CONCRETE.lime().asItem(),"HIT - nieuwe kaart","hit");
+                    button(41,Blocks.CONCRETE.red().asItem(),"STAND - dealer speelt uit","stand");
                 } else {
                     button(20,Items.PAPER,"Geen actieve ronde","noop");
                     button(38,Items.GOLD_NUGGET,"Inzet 1 diamond","bet1");
@@ -619,14 +619,14 @@ public final class CasinoCraft implements ModInitializer {
                     button(40,Items.DIAMOND,"Inzet 10 diamonds","bet10");
                     button(41,Items.DIAMOND_BLOCK,"Inzet 32 diamonds","bet32");
                     button(42,Items.EMERALD_BLOCK,"Inzet 64 diamonds","bet64");
-                    button(49,Items.LIME_CONCRETE,"DEEL KAARTEN - "+session.stake+" diamonds","deal");
+                    button(49,Blocks.CONCRETE.lime().asItem(),"DEEL KAARTEN - "+session.stake+" diamonds","deal");
                 }
             } else if(session.type.equals("higherlower")) {
                 button(4,Items.BOOK,"HOGER OF LAGER - Raad de volgende kaart","noop");
                 if(session.rounds>0) {
                     button(22,Items.PAPER,"Huidige kaart: "+session.value+" | reeks: "+session.rounds,"noop");
-                    button(38,Items.LIME_CONCRETE,"HOGER","higher");
-                    button(40,Items.RED_CONCRETE,"LAGER","lower");
+                    button(38,Blocks.CONCRETE.lime().asItem(),"HOGER","higher");
+                    button(40,Blocks.CONCRETE.red().asItem(),"LAGER","lower");
                     long prize=(long)session.stake*Math.min(32,1L<<Math.min(5,session.rounds-1));
                     button(42,Items.DIAMOND,"INNEN - "+prize+" diamonds","cashout");
                 } else {
@@ -636,7 +636,7 @@ public final class CasinoCraft implements ModInitializer {
                     button(40,Items.DIAMOND,"Inzet 10 diamonds","bet10");
                     button(41,Items.DIAMOND_BLOCK,"Inzet 32 diamonds","bet32");
                     button(42,Items.EMERALD_BLOCK,"Inzet 64 diamonds","bet64");
-                    button(49,Items.LIME_CONCRETE,"START - "+session.stake+" diamonds","deal");
+                    button(49,Blocks.CONCRETE.lime().asItem(),"START - "+session.stake+" diamonds","deal");
                 }
             }
             broadcastChanges();
