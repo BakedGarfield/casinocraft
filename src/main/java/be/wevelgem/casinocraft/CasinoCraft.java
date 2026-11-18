@@ -430,7 +430,7 @@ public final class CasinoCraft implements ModInitializer {
         chosenWinner=weightedWinner();raceTicks=0;
         for(int i=0;i<5;i++){
             Horse horse=EntityTypes.HORSE.create(level,EntitySpawnReason.COMMAND);
-            if(horse!=null){horse.setNoAi(true);horse.setInvulnerable(true);
+            if(horse!=null){horse.setNoAi(true);horse.setPermanentlyInvulnerable(true);
                 ItemStack coloredArmor = new ItemStack(Items.LEATHER_HORSE_ARMOR);
                 coloredArmor.set(DataComponents.DYED_COLOR, new DyedItemColor(horseColors[i]));
                 horse.setItemSlot(EquipmentSlot.BODY, coloredArmor);
