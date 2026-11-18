@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.Commands;
+import net.minecraft.server.permissions.Permissions;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.ClickEvent;
@@ -17,9 +18,9 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EntityTypes;
 import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.animal.horse.Horse;
+import net.minecraft.world.entity.animal.equine.Horse;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.DyedItemColor;
@@ -80,7 +81,7 @@ public final class CasinoCraft implements ModInitializer {
                 .then(Commands.argument("action", StringArgumentType.word())
                     .executes(ctx -> action(ctx.getSource().getPlayerOrException(), StringArgumentType.getString(ctx,"action")))));
             dispatcher.register(Commands.literal("casino")
-                .requires(src -> src.hasPermission(2))
+                .requires(src -> src.permissions().hasPermission(Permissions.COMMANDS_MODERATOR))
                 .then(Commands.literal("block")
                     .then(Commands.literal("set").then(Commands.argument("game", StringArgumentType.word())
                         .executes(ctx -> registerBlock(ctx.getSource().getPlayerOrException(),StringArgumentType.getString(ctx,"game")))))
@@ -428,7 +429,7 @@ public final class CasinoCraft implements ModInitializer {
         runners.clear();Arrays.fill(raceProgress,0);
         chosenWinner=weightedWinner();raceTicks=0;
         for(int i=0;i<5;i++){
-            Horse horse=EntityType.HORSE.create(level,EntitySpawnReason.COMMAND);
+            Horse horse=EntityTypes.HORSE.create(level,EntitySpawnReason.COMMAND);
             if(horse!=null){horse.setNoAi(true);horse.setInvulnerable(true);
                 ItemStack coloredArmor = new ItemStack(Items.LEATHER_HORSE_ARMOR);
                 coloredArmor.set(DataComponents.DYED_COLOR, new DyedItemColor(horseColors[i]));

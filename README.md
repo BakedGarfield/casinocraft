@@ -104,3 +104,12 @@ Standaardkleuren:
 Wijzig een kleur als admin via `/casino horse color <1-5> <RRGGBB>`, bijvoorbeeld `/casino horse color 1 FF6600` voor oranje pantser op paard 1. Gebruik zes hextekens zonder hekje. De RGB-waarden worden automatisch opgeslagen als `horseColors` in `casinocraft.json` en blijven na een serverherstart behouden. Kleuren zijn decoratief en veranderen de kansen of uitbetalingen niet. Wijzigingen gelden voor nieuwe races.
 
 **Buildstatus:** Nog niet gecompileerd/getest op Minecraft 26.3. Er kunnen incompatibiliteiten in de Fabric/Minecraft-API bestaan; compileer en test eerst op een aparte server. De betalingen en crashbestendigheid zijn nog alfa.
+
+
+## Compile fixes (2026-11-18)
+- Minecraft 26.3 `Horse` import moved to `net.minecraft.world.entity.animal.equine.Horse`.
+- Horse entity type is now defined in `EntityTypes.HORSE`.
+- Commands permission check uses `src.permissions().hasPermission(Permissions.COMMANDS_MODERATOR)`.
+- CI installs Gradle 9.8.0 for Loom 1.19.4.
+
+These source-level fixes have **not yet been compiled or tested**. Run the GitHub Actions workflow and inspect any remaining errors.
