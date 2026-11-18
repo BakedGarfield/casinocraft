@@ -10,6 +10,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.commands.Commands;
 import net.minecraft.server.permissions.Permissions;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
@@ -80,6 +82,11 @@ public final class CasinoCraft implements ModInitializer {
     private double trackRadiusX = 28.0, trackRadiusZ = 21.0, laneWidth = 3.0;
     private int tick, countdown = -1, raceTicks = -1, chosenWinner = -1;
     private final double[] raceProgress = new double[5];
+    // Each lane has a lookup table of equally spaced distances around its ellipse.
+    // Mapping time -> distance avoids horses speeding up on the narrow bends.
+    private static final int RACE_PATH_STEPS = 720;
+    private final double[][] laneDistance = new double[5][RACE_PATH_STEPS + 1];
+    private final double[] laneLength = new double[5];
     private boolean dirty;
 
     private record RouletteChip(String choice, int amount) {}
@@ -557,29 +564,99 @@ public final class CasinoCraft implements ModInitializer {
     private void second(){
         if(server==null)return;
         for(UUID id:new ArrayList<>(unpaid.keySet()))deliver(id);
-        if(countdown>0){countdown--;if(countdown%15==0)broadcast("Paardenrace start over "+countdown+" seconden!");}
+        if(countdown>0){countdown--;if(countdown%15==0 || countdown<=5)notifyHorsePlayers("Paardenrace start over "+countdown+" seconden!");}
         if(countdown==0){countdown=-1;startRace();}
         for(CasinoMenu menu:new ArrayList<>(openMenus.values()))
             if(menu.session.type.equals("horse"))menu.refresh();
     }
-    private void broadcast(String msg){if(server!=null)server.getPlayerList().broadcastSystemMessage(Component.literal("[CasinoCraft] "+msg),false);}
+    // No global chat: only players who bought into this particular race are notified.
+    private void notifyHorsePlayers(String text) {
+        if (server == null) return;
+        Set<UUID> participants = new HashSet<>();
+        for (Bet bet : bets) participants.add(bet.player());
+        for (UUID id : participants) {
+            ServerPlayer player = server.getPlayerList().getPlayer(id);
+            if (player != null) msg(player, text);
+        }
+    }
+    private void prepareOvalPaths() {
+        for (int lane = 0; lane < 5; lane++) {
+            laneDistance[lane][0] = 0;
+            double[] before = oval(lane, 0);
+            for (int step = 1; step <= RACE_PATH_STEPS; step++) {
+                double[] now = oval(lane, (double) step / RACE_PATH_STEPS);
+                laneDistance[lane][step] = laneDistance[lane][step-1] +
+                    Math.hypot(now[0] - before[0], now[1] - before[1]);
+                before = now;
+            }
+            laneLength[lane] = laneDistance[lane][RACE_PATH_STEPS];
+        }
+    }
+    // Return an angle progress corresponding to a fraction of true path length.
+    private double evenDistanceProgress(int lane, double completed) {
+        if (completed <= 0) return 0;
+        if (completed >= 1) return 1;
+        double target = completed * laneLength[lane];
+        int lo = 0, hi = RACE_PATH_STEPS;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (laneDistance[lane][mid] < target) lo = mid;
+            else hi = mid;
+        }
+        double span = laneDistance[lane][hi] - laneDistance[lane][lo];
+        double offset = span > 0 ? (target - laneDistance[lane][lo]) / span : 0;
+        return (lo + offset) / RACE_PATH_STEPS;
+    }
+    // Natural Minecraft yaw: face the tangent of the route rather than sideways.
+    private void orientHorse(Horse horse, int lane, double progress) {
+        double a = evenDistanceProgress(lane, progress);
+        double b = evenDistanceProgress(lane, Math.min(1,progress + 0.002));
+        if (b == a) { a = evenDistanceProgress(lane,Math.max(0,progress - 0.002)); b = 1; }
+        double[] from = oval(lane,a), to = oval(lane,b);
+        float yaw = (float)Math.toDegrees(Math.atan2(-(to[0]-from[0]),to[1]-from[1]));
+        horse.setYRot(yaw);
+        horse.setYHeadRot(yaw);
+        horse.setYBodyRot(yaw);
+    }
     private void startRace(){
         if(bets.isEmpty()||trackCenter==null||!validChances())return;
         ServerLevel level=server.getAllLevels().iterator().next();
         for(ServerLevel candidate:server.getAllLevels())if(candidate.dimension().identifier().toString().equals(trackDimension)){level=candidate;break;}
-        runners.clear();Arrays.fill(raceProgress,0);
+        runners.clear();Arrays.fill(raceProgress,0);prepareOvalPaths();
         chosenWinner=weightedWinner();raceTicks=0;
         for(int i=0;i<5;i++){
             Horse horse=EntityTypes.HORSE.create(level,EntitySpawnReason.COMMAND);
-            if(horse!=null){horse.setNoAi(true);horse.setPermanentlyInvulnerable(true);
+            if(horse!=null){horse.setNoAi(true);horse.setNoGravity(true);horse.setPermanentlyInvulnerable(true);
                 ItemStack coloredArmor = new ItemStack(Items.LEATHER_HORSE_ARMOR);
                 coloredArmor.set(DataComponents.DYED_COLOR, new DyedItemColor(horseColors[i]));
                 horse.setItemSlot(EquipmentSlot.BODY, coloredArmor);
                 horse.setCustomName(Component.literal(NAMES[i]).withColor(horseColors[i]));horse.setCustomNameVisible(true);
-                double[] xy=oval(i,0);horse.setPos(xy[0],trackCenter.getY()+1,xy[1]);level.addFreshEntity(horse);runners.add(horse);}
+                double[] xy=oval(i,0);horse.setPos(xy[0],horseGroundY(level,xy[0],xy[1]),xy[1]);orientHorse(horse,i,0);level.addFreshEntity(horse);runners.add(horse);}
         }
-        broadcast("🐎 Race begonnen! Favoriet: "+NAMES[0]+"; verrassingen mogelijk!");dirty=true;
+        notifyHorsePlayers("🐎 Race begonnen! Vijf paarden zijn vertrokken.");dirty=true;
     }
+    /**
+     * Resolve the foot height close to the configured track plane. Look ONLY at
+     * floor blocks, not walls/obstacles at the horse's head or chest height.
+     * The centre command should be used while standing on the track surface.
+     * The horse is positioned directly, so it can pass through route obstructions.
+     */
+    private double horseGroundY(ServerLevel level, double x, double z) {
+        int bx = (int)Math.floor(x), bz = (int)Math.floor(z);
+        int base = trackCenter.getY();
+        // Prefer the configured surface and small downward ground variations.
+        for (int y = base - 1; y >= base - 4; y--) {
+            BlockPos pos = new BlockPos(bx, y, bz);
+            var shape = level.getBlockState(pos).getCollisionShape(level, pos);
+            if (!shape.isEmpty()) {
+                double top = y + shape.max(Direction.Axis.Y);
+                if (top <= base + 0.05) return top;
+            }
+        }
+        // A gap in the track: stay at track level rather than fall into it.
+        return base;
+    }
+
     private int weightedWinner(){int n=random.nextInt(100);for(int i=0;i<5;i++){n-=weights[i];if(n<0)return i;}return 4;}
     // Five concentric oval lanes. rx/ry are block offsets from the admin-selected center.
     private double[] oval(int lane,double progress){
@@ -590,23 +667,33 @@ public final class CasinoCraft implements ModInitializer {
     }
     private void stepRace(){
         raceTicks++;
-        // Predetermined weighted winner but a visible race with position variation.
-        // 45 seconds maximum at 20 ticks/s; others finish slightly later.
-        for(int i=0;i<5;i++){
-            double speed=i==chosenWinner?1.0/720:1.0/(760+i*18);
-            raceProgress[i]=Math.min(1,raceProgress[i]+speed);
-            if(i<runners.size()){
-                Horse h=runners.get(i);if(h.isAlive()){
-                    double[] pos=oval(i,raceProgress[i]);
-                    h.setPos(pos[0],trackCenter.getY()+1,pos[1]);
+        // All five horses traverse their full oval with consistent distance interpolation.
+        // The weighted winner arrives first, while the others remain in a close race.
+        for (int i = 0; i < 5; i++) {
+            int finishTicks = i == chosenWinner ? 720 : 755 + i * 13;
+            double progress = Math.min(1.0, (double)raceTicks / finishTicks);
+            raceProgress[i] = progress;
+            if (i < runners.size()) {
+                Horse horse = runners.get(i);
+                if (horse.isAlive()) {
+                    double pathProgress = evenDistanceProgress(i,progress);
+                    double[] pos = oval(i,pathProgress);
+                    ServerLevel horseLevel = (ServerLevel)horse.level();
+                    double groundY = horseGroundY(horseLevel,pos[0],pos[1]);
+                    // Absolute server position bypasses obstacles in the route.
+                    // Zero velocity + no gravity stops the entity drifting/falling
+                    // between ticks and avoids normal movement-based shoving.
+                    horse.setDeltaMovement(Vec3.ZERO);
+                    horse.setPos(pos[0],groundY,pos[1]);
+                    orientHorse(horse,i,progress);
                 }
             }
         }
-        if(raceProgress[chosenWinner]>=1){finishRace();}
+        if (raceProgress[chosenWinner] >= 1) finishRace();
     }
     private void finishRace(){
         raceTicks=-1;
-        broadcast("🏆 Winnaar: "+NAMES[chosenWinner]+"! Uitbetaling: "+multipliers[chosenWinner]+"x.");
+        notifyHorsePlayers("🏆 Winnaar: "+NAMES[chosenWinner]+"! Uitbetaling: "+multipliers[chosenWinner]+"x.");
         // Persist pending payouts before attempting delivery. Actual crash-safe ledger requires additional testing.
         for(Bet bet:bets)if(bet.horse==chosenWinner)credit(bet.player,(long)bet.stake*bet.multiplier);
         bets.clear();for(Horse horse:runners)if(horse.isAlive())horse.discard();runners.clear();
