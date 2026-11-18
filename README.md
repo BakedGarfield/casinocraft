@@ -113,3 +113,22 @@ Wijzig een kleur als admin via `/casino horse color <1-5> <RRGGBB>`, bijvoorbeel
 - CI installs Gradle 9.8.0 for Loom 1.19.4.
 
 These source-level fixes have **not yet been compiled or tested**. Run the GitHub Actions workflow and inspect any remaining errors.
+
+
+## Adjustable oval track + roulette hologram update
+
+The roulette TextDisplay is now a two-line, colored label with a dark background and `CENTER` billboard constraints. Each player sees it facing their camera (vanilla client-side rendering, no additional mod). It shows the 10-second countdown, spins through wheel numbers during the last five seconds, and shows the final winning number/color.
+
+The horse track is still a **smooth oval** (not a straight racetrack). Its configurable values describe the centerline of the **outermost** lane, not the outer fence. Example administrator commands:
+
+```text
+/casino horse center
+/casino horse radiusx 40
+/casino horse radiusz 24
+/casino horse lanewidth 3
+/casino horse info
+```
+
+These values make an outermost centerline approximately 81 × 49 blocks, with five nested lanes 3 blocks apart. The outer fence must be farther out to give horses room. The width must satisfy both outer radii >= 4×laneWidth+3. To accommodate a larger lane width than the current values allow, first increase both radii; to make the track smaller, lower lane width first. Commands are restricted while a horse betting round or race is in progress. Values persist in `casinocraft.json` and default to 28/21/3 to preserve the previous layout.
+
+**Development status:** source patch only. No verified Minecraft 26.3 compilation or in-game test. Back up the world before using. Known caveat: the race moves horses with `setPos`, and entity hologram cleanup across server restarts still needs testing.

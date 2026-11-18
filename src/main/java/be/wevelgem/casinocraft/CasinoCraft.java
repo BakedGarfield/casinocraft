@@ -13,6 +13,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.ChatFormatting;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -75,6 +76,8 @@ public final class CasinoCraft implements ModInitializer {
     private MinecraftServer server;
     private BlockPos trackCenter;
     private String trackDimension = "minecraft:overworld";
+    // Outermost lane's centerline radii; inner four lanes offset by laneWidth.
+    private double trackRadiusX = 28.0, trackRadiusZ = 21.0, laneWidth = 3.0;
     private int tick, countdown = -1, raceTicks = -1, chosenWinner = -1;
     private final double[] raceProgress = new double[5];
     private boolean dirty;
@@ -87,6 +90,8 @@ public final class CasinoCraft implements ModInitializer {
         final String type;
         final String block;
         int stake = 1, selected = 0, value, dealer, rounds;
+        String resultTitle, resultDetail;
+        int resultExpiresAt = -1;
         boolean doubled;
         String roulettePage = "main";
         final List<RouletteChip> rouletteChips = new ArrayList<>();
@@ -129,6 +134,13 @@ public final class CasinoCraft implements ModInitializer {
                     .then(Commands.literal("remove").executes(ctx -> removeBlock(ctx.getSource().getPlayerOrException()))))
                 .then(Commands.literal("horse")
                     .then(Commands.literal("center").executes(ctx -> setCenter(ctx.getSource().getPlayerOrException())))
+                    .then(Commands.literal("radiusx").then(Commands.argument("blocks",IntegerArgumentType.integer(1,1000))
+                        .executes(ctx -> setTrackDimension(ctx.getSource().getPlayerOrException(), "x", IntegerArgumentType.getInteger(ctx,"blocks")))))
+                    .then(Commands.literal("radiusz").then(Commands.argument("blocks",IntegerArgumentType.integer(1,1000))
+                        .executes(ctx -> setTrackDimension(ctx.getSource().getPlayerOrException(), "z", IntegerArgumentType.getInteger(ctx,"blocks")))))
+                    .then(Commands.literal("lanewidth").then(Commands.argument("blocks",IntegerArgumentType.integer(1,50))
+                        .executes(ctx -> setTrackDimension(ctx.getSource().getPlayerOrException(), "lane", IntegerArgumentType.getInteger(ctx,"blocks")))))
+                    .then(Commands.literal("info").executes(ctx -> trackInfo(ctx.getSource().getPlayerOrException())))
                     .then(Commands.literal("chance").then(Commands.argument("horse",IntegerArgumentType.integer(1,5))
                         .then(Commands.argument("percent",IntegerArgumentType.integer(0,100))
                             .executes(ctx -> setHorse(ctx.getSource().getPlayerOrException(),true,IntegerArgumentType.getInteger(ctx,"horse")-1,IntegerArgumentType.getInteger(ctx,"percent"))))))
@@ -156,12 +168,36 @@ public final class CasinoCraft implements ModInitializer {
             if (tick % 20 == 0) second();
             if (raceTicks >= 0) stepRace();
             updateSlotSpins();
+            updateResultScreens();
             if (tick % 4 == 0) animateRouletteText();
             if (tick % 20 == 0) updateRouletteTables();
             if (tick % 200 == 0 && dirty) save();
         });
     }
 
+    /** Keep the result visible for five seconds before closing only that viewer's menu. */
+    private void showFinalResult(ServerPlayer p, Session s, String title, String detail) {
+        s.resultTitle = title;
+        s.resultDetail = detail;
+        s.resultExpiresAt = tick + 100;
+        CasinoMenu menu = openMenus.get(p.getUUID());
+        if (menu != null && menu.session == s) menu.refresh();
+        msg(p, title + " - " + detail);
+    }
+    private void updateResultScreens() {
+        for (var entry : new ArrayList<>(openMenus.entrySet())) {
+            CasinoMenu menu = entry.getValue();
+            Session session = menu.session;
+            if (session.resultExpiresAt < 0) continue;
+            ServerPlayer player = server.getPlayerList().getPlayer(entry.getKey());
+            if (tick >= session.resultExpiresAt) {
+                session.resultExpiresAt = -1;
+                session.resultTitle = null;
+                session.resultDetail = null;
+                if (player != null && openMenus.get(entry.getKey()) == menu) player.closeContainer();
+            } else if (tick % 20 == 0 && player != null) menu.refresh();
+        }
+    }
     private String key(String dim, BlockPos p) { return dim+"|"+p.getX()+","+p.getY()+","+p.getZ(); }
     private BlockPos targeted(ServerPlayer p) {
         var hit = p.pick(5,0,false);
@@ -184,8 +220,37 @@ public final class CasinoCraft implements ModInitializer {
         boolean removed=blocks.remove(blockKey)!=null;dirty|=removed;msg(p,removed?"Casinoblok verwijderd.":"Geen casinoblok hier.");return removed?1:0;
     }
     private int setCenter(ServerPlayer p) {
+        if (!canEditTrack(p)) return 0;
         trackCenter=p.blockPosition();trackDimension=p.level().dimension().identifier().toString();dirty=true;
         msg(p,"Midden renbaan ingesteld op "+trackCenter.toShortString()+". Bouw een ovaal met 5 banen rondom dit punt.");return 1;
+    }
+    private boolean canEditTrack(ServerPlayer p) {
+        if (raceTicks >= 0 || countdown >= 0 || !bets.isEmpty()) {
+            msg(p,"De renbaan kan niet worden aangepast terwijl een race of inzetronde actief is.");
+            return false;
+        }
+        return true;
+    }
+    private boolean validTrack(double rx, double rz, double spacing) {
+        return rx >= 4.0*spacing+3.0 && rz >= 4.0*spacing+3.0;
+    }
+    private int setTrackDimension(ServerPlayer p, String which, int blocks) {
+        if (!canEditTrack(p)) return 0;
+        double rx = which.equals("x") ? blocks : trackRadiusX;
+        double rz = which.equals("z") ? blocks : trackRadiusZ;
+        double width = which.equals("lane") ? blocks : laneWidth;
+        if (!validTrack(rx,rz,width)) {
+            msg(p,"Ongeldige afmetingen: beide buitenste stralen moeten minimaal (4 x baanbreedte + 3) zijn.");
+            return 0;
+        }
+        trackRadiusX=rx;trackRadiusZ=rz;laneWidth=width;dirty=true;
+        return trackInfo(p);
+    }
+    private int trackInfo(ServerPlayer p) {
+        msg(p,"Renbaan: buitenste route circa "+(int)(2*trackRadiusX+1)+" x "+(int)(2*trackRadiusZ+1)+
+            " blokken, tussenafstand routes "+(int)laneWidth+" blokken; binnenste stralen " +
+            (trackRadiusX-4*laneWidth)+" / "+(trackRadiusZ-4*laneWidth)+".");
+        return 1;
     }
     private int setHorse(ServerPlayer p, boolean chance, int horse, int value) {
         if(chance) {
@@ -435,29 +500,57 @@ public final class CasinoCraft implements ModInitializer {
         return 1;
     }
     private int blackjack(ServerPlayer p,Session s,String a){
+        if (s.resultExpiresAt >= 0) return 0;
         if(a.equals("deal")&&s.rounds==0){
             if(!debit(p,s.stake))return 0;
             s.value=card()+card();s.dealer=card();s.rounds=1;show(p,s);return 1;
         }
         if(s.rounds==0)return 0;
-        if(a.equals("hit")){s.value+=card();if(s.value>21){msg(p,"Bust: "+s.value+". Verloren.");s.rounds=0;}else show(p,s);return 1;}
+        if(a.equals("hit")){
+            s.value+=card();
+            if(s.value>21){
+                s.rounds=0;
+                showFinalResult(p,s,"BUST - VERLOREN", "Je hebt "+s.value+" punten, meer dan 21. Verlies: "+s.stake+" diamonds.");
+            }else show(p,s);
+            return 1;
+        }
         if(a.equals("stand")){
             int dealer=s.dealer+card();while(dealer<17)dealer+=card();
             int mult=(dealer>21||s.value>dealer)?2:(s.value==dealer?1:0);
-            msg(p,"Jij: "+s.value+" | dealer: "+dealer+". Uitbetaling: "+s.stake*mult+" diamonds.");
-            credit(p.getUUID(),(long)s.stake*mult);s.rounds=0;return 1;
+            long earned=(long)s.stake*mult;
+            credit(p.getUUID(),earned);
+            s.rounds=0;
+            String reason = dealer>21 ? "Dealer is bust ("+dealer+")." :
+                s.value>dealer ? "Jij hebt "+s.value+", dealer "+dealer+"." :
+                s.value==dealer ? "Gelijkspel: beide "+s.value+"." :
+                "Dealer heeft "+dealer+" en jij "+s.value+".";
+            showFinalResult(p,s,mult==0?"VERLOREN":mult==1?"GELIJKSPEL":"GEWONNEN",
+                reason+" Uitbetaling: "+earned+" diamonds.");
+            return 1;
         }return 0;
     }
     private int card(){return Math.min(10,random.nextInt(13)+1);}
     private int higherlower(ServerPlayer p,Session s,String a){
+        if (s.resultExpiresAt >= 0) return 0;
         if(a.equals("deal")&&s.rounds==0){if(!debit(p,s.stake))return 0;s.value=random.nextInt(13)+1;s.rounds=1;show(p,s);return 1;}
         if(s.rounds==0)return 0;
-        if(a.equals("cashout")){long prize=(long)s.stake*Math.min(32,1L<<Math.min(5,s.rounds-1));credit(p.getUUID(),prize);msg(p,"Geïnd: "+prize+" diamonds.");s.rounds=0;return 1;}
+        if(a.equals("cashout")){
+            long prize=(long)s.stake*Math.min(32,1L<<Math.min(5,s.rounds-1));
+            credit(p.getUUID(),prize);s.rounds=0;
+            showFinalResult(p,s,"UITBETAALD", "Je hebt op tijd gestopt en "+prize+" diamonds ontvangen.");
+            return 1;
+        }
         if(a.equals("higher")||a.equals("lower")){
-            int next=random.nextInt(13)+1;
-            boolean win=a.equals("higher")?next>s.value:next<s.value;
-            msg(p,"Volgende kaart: "+next+(win?". Correct!":". Verloren of gelijkspel."));
-            if(win){s.rounds++;s.value=next;show(p,s);}else s.rounds=0;
+            int previous=s.value, next=random.nextInt(13)+1;
+            boolean win=a.equals("higher")?next>previous:next<previous;
+            if(win){s.rounds++;s.value=next;show(p,s);}
+            else {
+                s.rounds=0;
+                String why = next==previous ? "De volgende kaart was gelijk ("+next+")." :
+                    "Je koos "+(a.equals("higher")?"HOGER":"LAGER")+", maar de volgende kaart was "+
+                    (next<previous?"LAGER":"HOGER")+" ("+previous+" naar "+next+").";
+                showFinalResult(p,s,"VERLOREN", why+" Verlies: "+s.stake+" diamonds.");
+            }
             return 1;
         }return 0;
     }
@@ -490,7 +583,8 @@ public final class CasinoCraft implements ModInitializer {
     private int weightedWinner(){int n=random.nextInt(100);for(int i=0;i<5;i++){n-=weights[i];if(n<0)return i;}return 4;}
     // Five concentric oval lanes. rx/ry are block offsets from the admin-selected center.
     private double[] oval(int lane,double progress){
-        double rx=16+lane*3.0,rz=9+lane*3.0;
+        // Lane 0 = innermost; lane 4 = outermost. Both adapt to admin settings.
+        double rx=trackRadiusX-(4-lane)*laneWidth,rz=trackRadiusZ-(4-lane)*laneWidth;
         double angle=progress*2*Math.PI-Math.PI/2;
         return new double[]{trackCenter.getX()+0.5+rx*Math.cos(angle),trackCenter.getZ()+0.5+rz*Math.sin(angle)};
     }
@@ -550,6 +644,17 @@ public final class CasinoCraft implements ModInitializer {
         }
         void refresh() {
             actions.clear();virtual.clearContent();
+            if(session.resultExpiresAt >= 0) {
+                boolean won = session.resultTitle != null &&
+                    (session.resultTitle.contains("GEWONNEN") || session.resultTitle.contains("UITBETAALD") || session.resultTitle.contains("UITSLAG"));
+                button(4,Items.BOOK,session.resultTitle == null ? "UITSLAG" : session.resultTitle,"noop");
+                button(22,won?Items.DIAMOND:Blocks.CONCRETE.red().asItem(),
+                    session.resultDetail == null ? "Uitslag wordt verwerkt" : session.resultDetail,"noop");
+                button(40,Items.CLOCK,"Venster sluit over "+Math.max(1,(session.resultExpiresAt-tick+19)/20)+" seconden","noop");
+                button(49,Items.BARRIER,"SLUIT RESULTAAT","closeResult");
+                broadcastChanges();
+                return;
+            }
             if(session.type.equals("slots")) {
                 button(10,Items.PAPER,"3 gelijk: Diamond 12x | Emerald 9x | Gold 7x","noop");
                 button(11,Items.PAPER,"Redstone 5x | Amethyst 4x | Nether Star 25x","noop");
@@ -657,6 +762,13 @@ public final class CasinoCraft implements ModInitializer {
     }
     private void handleGuiClick(ServerPlayer p,CasinoMenu menu,String action) {
         Session s=menu.session;
+        if (s.resultExpiresAt >= 0) {
+            if (action.equals("closeResult")) {
+                s.resultExpiresAt=-1;
+                p.closeContainer();
+            }
+            return;
+        }
         if(action.equals("page")){menu.page=1-menu.page;menu.refresh();return;}
         if(action.startsWith("bet")){
             try{s.stake=Integer.parseInt(action.substring(3));}catch(NumberFormatException ignored){return;}
@@ -702,7 +814,13 @@ public final class CasinoCraft implements ModInitializer {
                 long earned=(long)spin.wager*multiplier;
                 credit(spin.player,earned);
                 ServerPlayer p=server.getPlayerList().getPlayer(spin.player);
-                if(p!=null)msg(p,"Slots: "+SLOT_LABELS[a[0]]+" | "+SLOT_LABELS[a[1]]+" | "+SLOT_LABELS[a[2]]+". Uitbetaling: "+earned+" diamonds ("+multiplier+"x).");
+                if(p!=null) {
+                    String combo=SLOT_LABELS[a[0]]+" / "+SLOT_LABELS[a[1]]+" / "+SLOT_LABELS[a[2]];
+                    if(menu!=null && menu.session.type.equals("slots"))
+                        showFinalResult(p,menu.session,earned>0?"SLOTS - GEWONNEN":"SLOTS - VERLOREN",
+                            combo+". "+(earned>0?"Uitbetaling: "+earned+" diamonds ("+multiplier+"x).":"Geen winnende combinatie."));
+                    else msg(p,"Slots: "+combo+". Uitbetaling: "+earned+" diamonds.");
+                }
                 slotSpins.remove(spin.player);dirty=true;save();
                 if(menu!=null)menu.refresh();
             }
@@ -717,7 +835,7 @@ public final class CasinoCraft implements ModInitializer {
         if(!debit(p,s.stake))return;
         table.bets.add(new TableBet(p.getUUID(),choice,s.stake));
         if(table.seconds<0){table.seconds=10;table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);}
-        updateFloatingLabel(table,"ROULETTE | "+table.seconds+" sec");
+        updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
         dirty=true;save();
         msg(p,"Ingezet: "+s.stake+" diamonds op "+rouletteLabel(choice)+". Nog "+table.seconds+" seconden.");
         refreshTableMenus(s.block);
@@ -734,7 +852,7 @@ public final class CasinoCraft implements ModInitializer {
     private void updateRouletteTables() {
         for(RouletteTable table:new ArrayList<>(rouletteTables.values())) {
             if(table.seconds>0) {table.seconds--;
-                if(table.seconds>5)updateFloatingLabel(table,"ROULETTE | "+table.seconds+" sec");
+                if(table.seconds>5)updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
                 refreshTableMenus(table.block);
             }
             if(table.seconds==0) {
@@ -743,38 +861,69 @@ public final class CasinoCraft implements ModInitializer {
                 table.lastResult=winner;
                 updateFloatingResult(table,winner);
                 Map<UUID,Long> rewards=new HashMap<>();
-                for(TableBet b:table.bets)rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
+                Map<UUID,Integer> stakes=new HashMap<>();
+                for(TableBet b:table.bets) {
+                    rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
+                    stakes.merge(b.player,b.amount,Integer::sum);
+                }
                 // Record unpaid credits before leaving the round.
                 for(var e:rewards.entrySet())if(e.getValue()>0)unpaid.merge(e.getKey(),e.getValue(),Long::sum);
                 table.bets.clear();dirty=true;save();
                 for(UUID id:rewards.keySet()){
                     deliver(id);ServerPlayer p=server.getPlayerList().getPlayer(id);
-                    if(p!=null)msg(p,"Roulette: "+winner+" ("+rouletteColor(winner)+"). Uitbetaling "+rewards.get(id)+" diamonds.");
+                    if(p!=null) {
+                        Session playerSession=sessions.get(id);
+                        long paid=rewards.get(id);
+                        String detail="Nummer "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+"). " +
+                            (paid==0 ? "Geen van jouw inzetten won." : "Jouw winnende inzetten betaalden "+paid+" diamonds uit.") +
+                            " Inzet: "+stakes.getOrDefault(id,0)+" diamonds.";
+                        if(playerSession!=null && playerSession.type.equals("roulette") && playerSession.block.equals(table.block))
+                            showFinalResult(p,playerSession,paid==0?"ROULETTE - VERLOREN":"ROULETTE - UITSLAG",detail);
+                        else msg(p,"Roulette: "+detail);
+                    }
                 }
                 refreshTableMenus(table.block);
             }
         }
     }
-    private void updateFloatingResult(RouletteTable table,int winner) {
-        String[] pieces=table.block.split("\\|");if(pieces.length!=2)return;
+    private Display.TextDisplay getRouletteDisplay(RouletteTable table) {
+        if(table.display!=null && table.display.isAlive()) return table.display;
+        String[] pieces=table.block.split("\\|");
+        if(pieces.length!=2) return null;
         ServerLevel level=null;
-        for(ServerLevel l:server.getAllLevels())if(l.dimension().identifier().toString().equals(pieces[0])){level=l;break;}
-        if(level==null)return;
+        for(ServerLevel l:server.getAllLevels())
+            if(l.dimension().identifier().toString().equals(pieces[0])) {level=l;break;}
+        if(level==null) return null;
         String[] coords=pieces[1].split(",");
+        if(coords.length!=3)return null;
         BlockPos at=new BlockPos(Integer.parseInt(coords[0]),Integer.parseInt(coords[1]),Integer.parseInt(coords[2]));
-        if(table.display==null||!table.display.isAlive()){
-            table.display=EntityTypes.TEXT_DISPLAY.create(level,EntitySpawnReason.COMMAND);
-            if(table.display==null)return;
-            table.display.setPos(at.getX()+0.5,at.getY()+1.6,at.getZ()+0.5);
-            table.display.setNoGravity(true);
-            level.addFreshEntity(table.display);
-        }
-        table.display.setText(Component.literal("ROULETTE: "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+")"));
+        table.display=EntityTypes.TEXT_DISPLAY.create(level,EntitySpawnReason.COMMAND);
+        if(table.display==null)return null;
+        table.display.setPos(at.getX()+0.5,at.getY()+1.85,at.getZ()+0.5);
+        table.display.setNoGravity(true);
+        // Each vanilla client renders the billboard facing its OWN viewpoint.
+        table.display.setBillboardConstraints(Display.BillboardConstraints.CENTER);
+        table.display.setLineWidth(240);
+        table.display.setBackgroundColor(0xB0101018);
+        table.display.setFlags((byte)1); // text shadow, centered text
+        level.addFreshEntity(table.display);
+        return table.display;
+    }
+    private void updateFloatingResult(RouletteTable table,int winner) {
+        Display.TextDisplay display=getRouletteDisplay(table);
+        if(display==null)return;
+        ChatFormatting color = winner==0 ? ChatFormatting.GREEN :
+            RED_NUMBERS.contains(winner) ? ChatFormatting.RED : ChatFormatting.GRAY;
+        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+            .append(Component.literal("WINNAAR: ").withStyle(ChatFormatting.WHITE))
+            .append(Component.literal(winner+"  "+rouletteColor(winner).toUpperCase(Locale.ROOT)).withStyle(color,ChatFormatting.BOLD)));
     }
     private void updateFloatingLabel(RouletteTable table,String value) {
-        // Spawn/update a text-display above this particular registered block.
-        updateFloatingResult(table,random.nextInt(37));
-        if(table.display!=null)table.display.setText(Component.literal(value));
+        Display.TextDisplay display=getRouletteDisplay(table);
+        if(display==null)return;
+        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+            .append(Component.literal(value+"\n").withStyle(ChatFormatting.YELLOW))
+            .append(Component.literal(table.bets.size()+" inzet(ten) geplaatst").withStyle(ChatFormatting.GRAY)));
     }
     private void clearTable(String key) {
         RouletteTable table=rouletteTables.remove(key);
@@ -787,6 +936,11 @@ public final class CasinoCraft implements ModInitializer {
             JsonObject root=JsonParser.parseString(Files.readString(path())).getAsJsonObject();
             for(var e:root.getAsJsonObject("blocks").entrySet())blocks.put(e.getKey(),e.getValue().getAsString());
             if(root.has("trackCenter")){JsonObject t=root.getAsJsonObject("trackCenter");trackCenter=new BlockPos(t.get("x").getAsInt(),t.get("y").getAsInt(),t.get("z").getAsInt());trackDimension=t.get("dimension").getAsString();}
+            if(root.has("trackDimensions")) {
+                JsonObject t=root.getAsJsonObject("trackDimensions");
+                double rx=t.get("radiusX").getAsDouble(), rz=t.get("radiusZ").getAsDouble(), w=t.get("laneWidth").getAsDouble();
+                if(validTrack(rx,rz,w)){trackRadiusX=rx;trackRadiusZ=rz;laneWidth=w;}
+            }
             JsonArray ch=root.getAsJsonArray("chances"),pa=root.getAsJsonArray("payouts");
             for(int i=0;i<5;i++){weights[i]=ch.get(i).getAsInt();multipliers[i]=pa.get(i).getAsInt();}
             if(root.has("horseColors")){
@@ -818,6 +972,7 @@ public final class CasinoCraft implements ModInitializer {
             JsonObject root=new JsonObject(),bs=new JsonObject(),pending=new JsonObject();
             for(var e:blocks.entrySet())bs.addProperty(e.getKey(),e.getValue());root.add("blocks",bs);
             if(trackCenter!=null){JsonObject t=new JsonObject();t.addProperty("x",trackCenter.getX());t.addProperty("y",trackCenter.getY());t.addProperty("z",trackCenter.getZ());t.addProperty("dimension",trackDimension);root.add("trackCenter",t);}
+            JsonObject dimensions=new JsonObject();dimensions.addProperty("radiusX",trackRadiusX);dimensions.addProperty("radiusZ",trackRadiusZ);dimensions.addProperty("laneWidth",laneWidth);root.add("trackDimensions",dimensions);
             JsonArray ch=new JsonArray(),pa=new JsonArray(),betArray=new JsonArray();
             for(int n:weights)ch.add(n);for(int n:multipliers)pa.add(n);root.add("chances",ch);root.add("payouts",pa);
             JsonArray colors=new JsonArray();for(int rgb:horseColors)colors.add(rgb);root.add("horseColors",colors);
