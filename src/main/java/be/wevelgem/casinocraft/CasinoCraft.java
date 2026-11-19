@@ -1121,7 +1121,7 @@ public final class CasinoCraft implements ModInitializer {
             BlockPos at=new BlockPos(Integer.parseInt(xyz[0]),Integer.parseInt(xyz[1]),Integer.parseInt(xyz[2]));
             AABB area=new AABB(at).inflate(2.5);
             for (Display.TextDisplay display : level.getEntitiesOfClass(Display.TextDisplay.class,area,
-                e -> e != keep && (e.getTags().contains(ROULETTE_TAG) ||
+                e -> e != keep && (e.getCommandTags().contains(ROULETTE_TAG) ||
                     e.getText().getString().toUpperCase(Locale.ROOT).contains("ROULETTE")))) {
                 display.discard();
             }
