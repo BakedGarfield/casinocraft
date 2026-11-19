@@ -132,3 +132,7 @@ The horse track is still a **smooth oval** (not a straight racetrack). Its confi
 These values make an outermost centerline approximately 81 × 49 blocks, with five nested lanes 3 blocks apart. The outer fence must be farther out to give horses room. The width must satisfy both outer radii >= 4×laneWidth+3. To accommodate a larger lane width than the current values allow, first increase both radii; to make the track smaller, lower lane width first. Commands are restricted while a horse betting round or race is in progress. Values persist in `casinocraft.json` and default to 28/21/3 to preserve the previous layout.
 
 **Development status:** source patch only. No verified Minecraft 26.3 compilation or in-game test. Back up the world before using. Known caveat: the race moves horses with `setPos`, and entity hologram cleanup across server restarts still needs testing.
+
+## Roulette hologram/timer config (new)
+
+The roulette has a configurable 30-second betting period, followed by a separate random 15–30-second spinning period. The winning number is settled after spinning ends. The hologram disappears automatically 10 seconds after the result. The values and text can be configured on the server in `config/casinocraft/roulette.json`. See `ROULETTE_CONFIG_UPDATE.md` for the full reference.

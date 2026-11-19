@@ -1,0 +1,11 @@
+{
+  "bettingSeconds": 30,
+  "minimumSpinSeconds": 15,
+  "maximumSpinSeconds": 30,
+  "resultDisplaySeconds": 10,
+  "title": "✦ ROULETTE ✦",
+  "bettingText": "INZETTEN SLUITEN OVER {seconds}s",
+  "spinningText": "WIEL DRAAIT... {seconds}s",
+  "resultText": "WINNAAR: {number} {color}",
+  "betsText": "{bets} inzetten geplaatst"
+}

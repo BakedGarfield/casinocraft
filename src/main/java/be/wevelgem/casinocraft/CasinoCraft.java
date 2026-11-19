@@ -4,6 +4,7 @@ import com.google.gson.*;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -12,6 +13,7 @@ import net.minecraft.server.permissions.Permissions;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
@@ -68,6 +70,55 @@ public final class CasinoCraft implements ModInitializer {
     private final Map<String,String> blocks = new HashMap<>();
     private final Map<UUID,Session> sessions = new HashMap<>();
     private final Map<String,RouletteTable> rouletteTables = new HashMap<>();
+    private static final String ROULETTE_TAG = "casinocraft_roulette_hologram";
+    private RouletteConfig rouletteConfig = new RouletteConfig();
+    private boolean cleanedStartupDisplays;
+
+    /** Loaded from config/casinocraft/roulette.json on server startup. */
+    private static final class RouletteConfig {
+        int bettingSeconds = 30;
+        int minimumSpinSeconds = 15;
+        int maximumSpinSeconds = 30;
+        int resultDisplaySeconds = 10;
+        String title = "✦ ROULETTE ✦";
+        String bettingText = "INZETTEN SLUITEN OVER {seconds}s";
+        String spinningText = "WIEL DRAAIT... {seconds}s";
+        String resultText = "WINNAAR: {number} {color}";
+        String betsText = "{bets} inzetten geplaatst";
+    }
+
+    private Path rouletteConfigPath() {
+        return FabricLoader.getInstance().getConfigDir().resolve("casinocraft").resolve("roulette.json");
+    }
+    private void loadRouletteConfig() {
+        Path path = rouletteConfigPath();
+        try {
+            Files.createDirectories(path.getParent());
+            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+            if (!Files.exists(path)) Files.writeString(path, gson.toJson(new RouletteConfig()));
+            RouletteConfig loaded = gson.fromJson(Files.readString(path), RouletteConfig.class);
+            if (loaded == null) throw new IllegalArgumentException("empty config");
+            if (loaded.bettingSeconds < 5 || loaded.bettingSeconds > 600 ||
+                loaded.minimumSpinSeconds < 1 || loaded.maximumSpinSeconds > 300 ||
+                loaded.maximumSpinSeconds < loaded.minimumSpinSeconds ||
+                loaded.resultDisplaySeconds < 0 || loaded.resultDisplaySeconds > 600)
+                throw new IllegalArgumentException("invalid roulette times");
+            if (loaded.title == null || loaded.bettingText == null || loaded.spinningText == null ||
+                loaded.resultText == null || loaded.betsText == null)
+                throw new IllegalArgumentException("missing roulette text");
+            rouletteConfig = loaded;
+            System.out.println("[CasinoCraft] Roulette config loaded: " + path);
+        } catch (Exception ex) {
+            System.err.println("[CasinoCraft] Invalid roulette config, using safe defaults: " + ex);
+            rouletteConfig = new RouletteConfig();
+        }
+    }
+    private String rouletteText(String template, RouletteTable table, int seconds, int number) {
+        return template.replace("{seconds}", Integer.toString(seconds))
+            .replace("{bets}", Integer.toString(table.bets.size()))
+            .replace("{number}", Integer.toString(number))
+            .replace("{color}", number < 0 ? "" : rouletteColor(number).toUpperCase(Locale.ROOT));
+    }
     private final Map<UUID,SlotSpin> slotSpins = new HashMap<>();
     private final Map<UUID,CasinoMenu> openMenus = new HashMap<>();
     private final Map<UUID,Long> unpaid = new HashMap<>();
@@ -111,7 +162,9 @@ public final class CasinoCraft implements ModInitializer {
     private static final class RouletteTable {
         final String block;
         final List<TableBet> bets = new ArrayList<>();
-        int seconds = -1;
+        int seconds = -1; // betting countdown; -1 during spin/idle
+        int spinSeconds = -1; // spinning countdown; -1 outside spin
+        int displayExpiresAt = -1; // server tick; -1 while display should stay
         int lastResult = -1;
         int wheelIndex = 0;
         Display.TextDisplay display;
@@ -172,14 +225,22 @@ public final class CasinoCraft implements ModInitializer {
             return InteractionResult.SUCCESS;
         });
         ServerTickEvents.END_SERVER_TICK.register(s -> {
-            if (server == null) { server=s; load(); }
+            if (server == null) { server=s; loadRouletteConfig(); load(); }
             tick++;
             if (tick % 20 == 0) second();
             if (raceTicks >= 0) stepRace();
             updateSlotSpins();
             updateResultScreens();
             if (tick % 4 == 0) animateRouletteText();
-            if (tick % 20 == 0) updateRouletteTables();
+            if (tick == 40 && !cleanedStartupDisplays) {
+                cleanedStartupDisplays = true;
+                for (var entry : blocks.entrySet())
+                    if (entry.getValue().equals("roulette")) cleanupRouletteDisplays(entry.getKey(), null);
+            }
+            if (tick % 20 == 0) {
+                updateRouletteTables();
+                expireRouletteDisplays();
+            }
             if (tick % 200 == 0 && dirty) save();
         });
     }
@@ -788,7 +849,8 @@ public final class CasinoCraft implements ModInitializer {
                 button(24,Items.PAPER,"Dozijn 1 (3x)","rdozen1");button(25,Items.PAPER,"Dozijn 2 (3x)","rdozen2");button(26,Items.PAPER,"Dozijn 3 (3x)","rdozen3");
                 button(27,Items.PAPER,"Kolom 1 (3x)","rcolumn1");button(28,Items.PAPER,"Kolom 2 (3x)","rcolumn2");button(29,Items.PAPER,"Kolom 3 (3x)","rcolumn3");
                 button(30,Items.ARROW,page==0?"Volgende wielhelft":"Vorige wielhelft","page");
-                button(32,Items.CLOCK,table.seconds<0?"Wacht op eerste inzet":("Sluit over "+table.seconds+" sec"),"noop");
+                button(32,Items.CLOCK,table.spinSeconds>0 ? "Wiel draait nog " + table.spinSeconds + " sec" :
+                    table.seconds<0 ? "Wacht op eerste inzet" : ("Inzetten sluiten over " + table.seconds + " sec"), "noop");
                 int sum=0;for(TableBet b:table.bets)if(b.player.equals(viewer))sum+=b.amount;
                 button(33,Items.BOOK,"Jouw geplaatste inzetten: "+sum+" diamonds","noop");
                 button(38,Items.GOLD_NUGGET,"Inzet: 1 diamond","bet1");
@@ -955,14 +1017,14 @@ public final class CasinoCraft implements ModInitializer {
     }
     private void placeTableBet(ServerPlayer p,Session s,String choice) {
         RouletteTable table=rouletteTables.computeIfAbsent(s.block,RouletteTable::new);
-        if(table.seconds==0){msg(p,"Wacht tot de volgende ronde.");return;}
+        if(table.spinSeconds>=0 || table.seconds==0){msg(p,"Het wiel draait al. Wacht tot de volgende ronde.");return;}
         int individual=0, count=0;
         for(TableBet b:table.bets)if(b.player.equals(p.getUUID())){individual+=b.amount;count++;}
         if(individual+s.stake>MAX_ROULETTE_TOTAL||count>=MAX_ROULETTE_CHIPS){msg(p,"Maximum 256 diamonds en 64 inzetten per speler per ronde.");return;}
         if(!debit(p,s.stake))return;
         table.bets.add(new TableBet(p.getUUID(),choice,s.stake));
-        if(table.seconds<0){table.seconds=10;table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);}
-        updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
+        if(table.seconds<0){table.seconds=rouletteConfig.bettingSeconds;table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);table.displayExpiresAt=-1;}
+        updateFloatingLabel(table,rouletteText(rouletteConfig.bettingText,table,table.seconds,-1));
         dirty=true;save();
         msg(p,"Ingezet: "+s.stake+" diamonds op "+rouletteLabel(choice)+". Nog "+table.seconds+" seconden.");
         refreshTableMenus(s.block);
@@ -971,46 +1033,100 @@ public final class CasinoCraft implements ModInitializer {
         for(CasinoMenu m:new ArrayList<>(openMenus.values()))if(m.session.type.equals("roulette")&&m.session.block.equals(block))m.refresh();
     }
     private void animateRouletteText() {
-        for(RouletteTable table:rouletteTables.values())if(table.seconds>0&&table.seconds<=5) {
-            table.wheelIndex=(table.wheelIndex+1)%EUROPEAN_WHEEL.length;
-            updateFloatingResult(table,EUROPEAN_WHEEL[table.wheelIndex]);
+        for (RouletteTable table : rouletteTables.values()) if (table.spinSeconds > 0) {
+            // Animate through adjacent values in genuine European roulette wheel order.
+            table.wheelIndex = (table.wheelIndex + 1) % EUROPEAN_WHEEL.length;
+            updateFloatingLabel(table,rouletteText(rouletteConfig.spinningText,table,table.spinSeconds,-1)
+                + "\n" + EUROPEAN_WHEEL[table.wheelIndex]);
         }
     }
     private void updateRouletteTables() {
-        for(RouletteTable table:new ArrayList<>(rouletteTables.values())) {
-            if(table.seconds>0) {table.seconds--;
-                if(table.seconds>5)updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
-                refreshTableMenus(table.block);
-            }
-            if(table.seconds==0) {
-                table.seconds=-1;
-                int winner=random.nextInt(37);
-                table.lastResult=winner;
-                updateFloatingResult(table,winner);
-                Map<UUID,Long> rewards=new HashMap<>();
-                Map<UUID,Integer> stakes=new HashMap<>();
-                for(TableBet b:table.bets) {
-                    rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
-                    stakes.merge(b.player,b.amount,Integer::sum);
+        for (RouletteTable table : new ArrayList<>(rouletteTables.values())) {
+            if (table.seconds > 0) {
+                table.seconds--;
+                if (table.seconds > 0) {
+                    updateFloatingLabel(table,rouletteText(rouletteConfig.bettingText,table,table.seconds,-1));
+                } else {
+                    table.seconds = -1;
+                    int min = rouletteConfig.minimumSpinSeconds;
+                    int max = rouletteConfig.maximumSpinSeconds;
+                    table.spinSeconds = min + random.nextInt(max - min + 1);
+                    table.wheelIndex = random.nextInt(EUROPEAN_WHEEL.length);
+                    updateFloatingLabel(table,rouletteText(rouletteConfig.spinningText,table,table.spinSeconds,-1));
                 }
-                // Record unpaid credits before leaving the round.
-                for(var e:rewards.entrySet())if(e.getValue()>0)unpaid.merge(e.getKey(),e.getValue(),Long::sum);
-                table.bets.clear();dirty=true;save();
-                for(UUID id:rewards.keySet()){
-                    deliver(id);ServerPlayer p=server.getPlayerList().getPlayer(id);
-                    if(p!=null) {
-                        Session playerSession=sessions.get(id);
-                        long paid=rewards.get(id);
-                        String detail="Nummer "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+"). " +
-                            (paid==0 ? "Geen van jouw inzetten won." : "Jouw winnende inzetten betaalden "+paid+" diamonds uit.") +
-                            " Inzet: "+stakes.getOrDefault(id,0)+" diamonds.";
-                        if(playerSession!=null && playerSession.type.equals("roulette") && playerSession.block.equals(table.block))
-                            showFinalResult(p,playerSession,paid==0?"ROULETTE - VERLOREN":"ROULETTE - UITSLAG",detail);
-                        else msg(p,"Roulette: "+detail);
-                    }
+                refreshTableMenus(table.block);
+            } else if (table.spinSeconds > 0) {
+                table.spinSeconds--;
+                if (table.spinSeconds > 0) {
+                    updateFloatingLabel(table,rouletteText(rouletteConfig.spinningText,table,table.spinSeconds,-1)
+                        + "\n" + EUROPEAN_WHEEL[table.wheelIndex]);
+                } else {
+                    table.spinSeconds = -1;
+                    settleRoulette(table);
                 }
                 refreshTableMenus(table.block);
             }
+        }
+    }
+    private void settleRoulette(RouletteTable table) {
+        // One randomly sampled number shared by all players at this registered table.
+        int winner = random.nextInt(37);
+        table.lastResult = winner;
+        updateFloatingResult(table,winner);
+        table.displayExpiresAt = tick + rouletteConfig.resultDisplaySeconds * 20;
+        Map<UUID,Long> rewards = new HashMap<>();
+        Map<UUID,Integer> stakes = new HashMap<>();
+        for (TableBet b : table.bets) {
+            rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
+            stakes.merge(b.player,b.amount,Integer::sum);
+        }
+        // Persist pending payouts BEFORE delivering them, then clear settled wagers.
+        for (var e : rewards.entrySet()) if(e.getValue()>0) unpaid.merge(e.getKey(),e.getValue(),Long::sum);
+        table.bets.clear(); dirty=true; save();
+        for (UUID id : rewards.keySet()) {
+            deliver(id);
+            ServerPlayer player=server.getPlayerList().getPlayer(id);
+            if(player != null) {
+                Session playerSession=sessions.get(id);
+                long paid=rewards.get(id);
+                String detail="Nummer "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+"). " +
+                    (paid==0 ? "Geen van jouw inzetten won." : "Jouw winnende inzetten betaalden "+paid+" diamonds uit.") +
+                    " Inzet: "+stakes.getOrDefault(id,0)+" diamonds.";
+                if(playerSession!=null && playerSession.type.equals("roulette") && playerSession.block.equals(table.block))
+                    showFinalResult(player,playerSession,paid==0?"ROULETTE - VERLOREN":"ROULETTE - UITSLAG",detail);
+                else msg(player,"Roulette: "+detail);
+            }
+        }
+        refreshTableMenus(table.block);
+    }
+    private void expireRouletteDisplays() {
+        for (RouletteTable table : rouletteTables.values()) {
+            if (table.displayExpiresAt>=0 && tick>=table.displayExpiresAt && table.seconds<0 && table.spinSeconds<0) {
+                if (table.display != null && table.display.isAlive()) table.display.discard();
+                table.display=null;
+                table.displayExpiresAt=-1;
+            }
+        }
+    }
+    /** Remove old CasinoCraft roulette displays at this registered table, not arbitrary holograms elsewhere. */
+    private void cleanupRouletteDisplays(String block, Display.TextDisplay keep) {
+        String[] pieces=block.split("\\|");
+        if (pieces.length!=2) return;
+        ServerLevel level=null;
+        for (ServerLevel l:server.getAllLevels())
+            if(l.dimension().identifier().toString().equals(pieces[0])) {level=l;break;}
+        if(level==null) return;
+        try {
+            String[] xyz=pieces[1].split(",");
+            BlockPos at=new BlockPos(Integer.parseInt(xyz[0]),Integer.parseInt(xyz[1]),Integer.parseInt(xyz[2]));
+            AABB area=new AABB(at).inflate(2.5);
+            for (Display.TextDisplay display : level.getEntitiesOfClass(Display.TextDisplay.class,area,
+                e -> e != keep && (e.getTags().contains(ROULETTE_TAG) ||
+                    e.getText().getString().toUpperCase(Locale.ROOT).contains("ROULETTE")))) {
+                display.discard();
+            }
+        } catch (Exception e) {
+            System.err.println("[CasinoCraft] Could not cleanup old roulette displays at " + block + ": " + e);
         }
     }
     private Display.TextDisplay getRouletteDisplay(RouletteTable table) {
@@ -1024,10 +1140,14 @@ public final class CasinoCraft implements ModInitializer {
         String[] coords=pieces[1].split(",");
         if(coords.length!=3)return null;
         BlockPos at=new BlockPos(Integer.parseInt(coords[0]),Integer.parseInt(coords[1]),Integer.parseInt(coords[2]));
+        // When the old display reference is gone (including after a restart), clean up
+        // legacy roulette text displays within the small area of this registered block.
+        cleanupRouletteDisplays(table.block,null);
         table.display=EntityTypes.TEXT_DISPLAY.create(level,EntitySpawnReason.COMMAND);
         if(table.display==null)return null;
         table.display.setPos(at.getX()+0.5,at.getY()+1.85,at.getZ()+0.5);
         table.display.setNoGravity(true);
+        table.display.addTag(ROULETTE_TAG);
         // Each vanilla client renders the billboard facing its OWN viewpoint.
         table.display.setBillboardConstraints(Display.BillboardConstraints.CENTER);
         table.display.setLineWidth(240);
@@ -1041,20 +1161,20 @@ public final class CasinoCraft implements ModInitializer {
         if(display==null)return;
         ChatFormatting color = winner==0 ? ChatFormatting.GREEN :
             RED_NUMBERS.contains(winner) ? ChatFormatting.RED : ChatFormatting.GRAY;
-        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
-            .append(Component.literal("WINNAAR: ").withStyle(ChatFormatting.WHITE))
-            .append(Component.literal(winner+"  "+rouletteColor(winner).toUpperCase(Locale.ROOT)).withStyle(color,ChatFormatting.BOLD)));
+        display.setText(Component.literal(rouletteConfig.title+"\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+            .append(Component.literal(rouletteText(rouletteConfig.resultText,table,0,winner)).withStyle(color,ChatFormatting.BOLD)));
     }
     private void updateFloatingLabel(RouletteTable table,String value) {
         Display.TextDisplay display=getRouletteDisplay(table);
         if(display==null)return;
-        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+        display.setText(Component.literal(rouletteConfig.title+"\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
             .append(Component.literal(value+"\n").withStyle(ChatFormatting.YELLOW))
-            .append(Component.literal(table.bets.size()+" inzet(ten) geplaatst").withStyle(ChatFormatting.GRAY)));
+            .append(Component.literal(rouletteText(rouletteConfig.betsText,table,0,-1)).withStyle(ChatFormatting.GRAY)));
     }
     private void clearTable(String key) {
         RouletteTable table=rouletteTables.remove(key);
         if(table!=null&&table.display!=null&&table.display.isAlive())table.display.discard();
+        cleanupRouletteDisplays(key,null);
     }
     private Path path(){return server.getWorldPath(LevelResource.ROOT).resolve("casinocraft.json");}
     private void load(){
