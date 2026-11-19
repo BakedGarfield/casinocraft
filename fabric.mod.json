@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "casinocraft",
+  "version": "${version}",
+  "name": "CasinoCraft",
+  "description": "Server-side, diamond-based casino games activated by registered vanilla blocks.",
+  "authors": ["CasinoCraft community project"],
+  "environment": "*",
+  "entrypoints": {"main": ["be.wevelgem.casinocraft.CasinoCraft"]},
+  "depends": {"fabricloader": ">=0.20.1", "minecraft": "26.3", "java": ">=25", "fabric-api": "*"}
+}
