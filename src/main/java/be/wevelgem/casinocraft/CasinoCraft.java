@@ -375,7 +375,7 @@ public final class CasinoCraft implements ModInitializer {
             for(int i=0;i<5;i++)horseLink(p,i);
             msg(p,"Gekozen: "+NAMES[s.selected]+". Nieuwe inzetten sluiten bij de start.");
         } else if(s.type.equals("blackjack") && s.rounds>0){msg(p,"Jouw score: "+s.value+" | dealer zichtbaar: "+s.dealer);link(p,"Hit","hit");link(p,"Stand","stand");return;
-        } else if(s.type.equals("higherlower") && s.rounds>0){msg(p,"Huidige kaart: "+s.value+" | reeks: "+s.rounds);link(p,"Hoger","higher");link(p,"Lager","lower");link(p,"Innemen","cashout");return;}
+        } else if(s.type.equals("higherlower") && s.rounds>0){msg(p,"Huidige kaart: "+s.value+" | juist: "+(s.rounds-1)+" | prijs: "+higherLowerMultiplier(s)+"x");link(p,"Hoger","higher");link(p,"Lager","lower");if(s.rounds-1>=2)link(p,"Innemen","cashout");else msg(p,"Innemen pas mogelijk na 2 juiste voorspellingen (nog "+(2-(s.rounds-1))+" nodig).");return;}
         else if(s.type.equals("roulette")){
             showRoulette(p,s);
         }
@@ -600,12 +600,23 @@ public final class CasinoCraft implements ModInitializer {
         }return 0;
     }
     private int card(){return Math.min(10,random.nextInt(13)+1);}
+    // The opening card does not count as a correct prediction.
+    // 0-1 correct: 1x, 2-3 correct: 2x, 4-5 correct: 3x, etc.
+    private int higherLowerMultiplier(Session session) {
+        int correctGuesses = Math.max(0, session.rounds - 1);
+        return Math.min(32, 1 + correctGuesses / 2);
+    }
     private int higherlower(ServerPlayer p,Session s,String a){
         if (s.resultExpiresAt >= 0) return 0;
         if(a.equals("deal")&&s.rounds==0){if(!debit(p,s.stake))return 0;s.value=random.nextInt(13)+1;s.rounds=1;show(p,s);return 1;}
         if(s.rounds==0)return 0;
         if(a.equals("cashout")){
-            long prize=(long)s.stake*Math.min(32,1L<<Math.min(5,s.rounds-1));
+            // Never allow early payouts, including direct or stale menu clicks.
+            if (s.rounds - 1 < 2) {
+                msg(p,"Je moet eerst 2 keer juist raden voordat je diamonds kunt innen.");
+                return 0;
+            }
+            long prize=(long)s.stake*higherLowerMultiplier(s);
             credit(p.getUUID(),prize);s.rounds=0;
             showFinalResult(p,s,"UITBETAALD", "Je hebt op tijd gestopt en "+prize+" diamonds ontvangen.");
             return 1;
@@ -894,13 +905,17 @@ public final class CasinoCraft implements ModInitializer {
                     button(49,Blocks.CONCRETE.lime().asItem(),"DEEL KAARTEN - "+session.stake+" diamonds","deal");
                 }
             } else if(session.type.equals("higherlower")) {
-                button(4,Items.BOOK,"HOGER OF LAGER - Raad de volgende kaart","noop");
+                button(4,Items.BOOK,"HOGER OF LAGER - iedere 2 juiste gokken +1x","noop");
                 if(session.rounds>0) {
-                    button(22,Items.PAPER,"Huidige kaart: "+session.value+" | reeks: "+session.rounds,"noop");
+                    button(22,Items.PAPER,"Kaart: "+session.value+" | Juist: "+(session.rounds-1)+" | Uitbetaling: "+higherLowerMultiplier(session)+"x","noop");
                     button(38,Blocks.CONCRETE.lime().asItem(),"HOGER","higher");
                     button(40,Blocks.CONCRETE.red().asItem(),"LAGER","lower");
-                    long prize=(long)session.stake*Math.min(32,1L<<Math.min(5,session.rounds-1));
-                    button(42,Items.DIAMOND,"INNEN - "+prize+" diamonds","cashout");
+                    long prize=(long)session.stake*higherLowerMultiplier(session);
+                    if (session.rounds - 1 >= 2) {
+                        button(42,Items.DIAMOND,"INNEN - "+prize+" diamonds","cashout");
+                    } else {
+                        button(42,Items.BARRIER,"INNEN VERGRENDELD - nog "+(2-(session.rounds-1))+" juist nodig","noop");
+                    }
                 } else {
                     button(22,Items.PAPER,"Begin een nieuw spel","noop");
                     button(38,Items.GOLD_NUGGET,"Inzet 1 diamond","bet1");

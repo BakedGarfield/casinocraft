@@ -136,3 +136,23 @@ These values make an outermost centerline approximately 81 × 49 blocks, with fi
 ## Roulette hologram/timer config (new)
 
 The roulette has a configurable 30-second betting period, followed by a separate random 15–30-second spinning period. The winning number is settled after spinning ends. The hologram disappears automatically 10 seconds after the result. The values and text can be configured on the server in `config/casinocraft/roulette.json`. See `ROULETTE_CONFIG_UPDATE.md` for the full reference.
+
+
+### Higher / Lower payouts (this revision)
+
+The starting card does not count as a correct guess. A successful higher/lower prediction increments the correct-guess counter. Cash-out payouts include the original stake:
+
+| Correct predictions | Total payout |
+| --- | --- |
+| 0–1 | 1× stake |
+| 2–3 | 2× stake |
+| 4–5 | 3× stake |
+| 6–7 | 4× stake |
+| 8–9 | 5× stake |
+
+The multiplier increases by 1 for every two correct predictions, up to 32×. Losing a prediction forfeits the wager. The menu displays the correct prediction count, multiplier and cash-out amount.
+
+This remains an uncompiled source build; validate the `entityTags()` mapping and all payout behavior in GitHub Actions and on a test server before use.
+
+### Hoger of Lager cash-out beperking
+Diamonds innen kan pas na **twee juiste voorspellingen**. De GUI toont daarvoor een vergrendelde knop. Uitbetalingen: 2 juist = 2x, 4 juist = 3x, 6 juist = 4x, enzovoort.
