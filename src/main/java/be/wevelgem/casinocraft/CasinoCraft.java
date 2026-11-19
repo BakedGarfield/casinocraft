@@ -98,6 +98,8 @@ public final class CasinoCraft implements ModInitializer {
         final String block;
         int stake = 1, selected = 0, value, dealer, rounds;
         String resultTitle, resultDetail;
+        int[] lastSlotSymbols;
+        String lastSlotTitle, lastSlotDetail;
         int resultExpiresAt = -1;
         boolean doubled;
         String roulettePage = "main";
@@ -743,17 +745,33 @@ public final class CasinoCraft implements ModInitializer {
                 return;
             }
             if(session.type.equals("slots")) {
+                SlotSpin activeSpin = slotSpins.get(viewer);
                 button(10,Items.PAPER,"3 gelijk: Diamond 12x | Emerald 9x | Gold 7x","noop");
                 button(11,Items.PAPER,"Redstone 5x | Amethyst 4x | Nether Star 25x","noop");
                 button(12,Items.PAPER,"2 gelijk: symbolen betalen 1-5x","noop");
-                int[] reel=slotSpins.containsKey(viewer)?slotSpins.get(viewer).symbols:new int[]{0,2,1};
+                // Keep the last THREE actual outcomes visible after a spin until the next spin starts.
+                int[] reel = activeSpin != null ? activeSpin.symbols :
+                    (session.lastSlotSymbols != null ? session.lastSlotSymbols : new int[]{0,2,1});
                 for(int i=0;i<3;i++)button(21+i,SLOT_ITEMS[reel[i]],"Rol "+(i+1)+": "+SLOT_LABELS[reel[i]],"noop");
-                button(39,Blocks.WOOL.red().asItem(),"Inzet: 1 diamond","bet1");
-                button(40,Items.GOLD_INGOT,"Inzet: 5 diamonds","bet5");
-                button(41,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
-                button(42,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
-                button(43,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
-                button(49,Items.LEVER,"DRAAI - "+session.stake+" diamonds","spin");
+                if (activeSpin != null) {
+                    button(31,Items.CLOCK,"ROLLEN DRAAIEN...","noop");
+                    button(49,Items.CLOCK,"WACHT TOT DE ROLLEN STOPPEN","noop");
+                } else {
+                    if (session.lastSlotTitle != null) {
+                        button(30,Items.BOOK,session.lastSlotTitle,"noop");
+                        button(31,session.lastSlotDetail != null && session.lastSlotDetail.startsWith("Uitbetaling:")
+                            ? Items.DIAMOND : Items.BARRIER,
+                            session.lastSlotDetail == null ? "" : session.lastSlotDetail,"noop");
+                    } else {
+                        button(31,Items.BOOK,"Kies je inzet en draai!","noop");
+                    }
+                    button(39,Blocks.WOOL.red().asItem(),"Inzet: 1 diamond","bet1");
+                    button(40,Items.GOLD_INGOT,"Inzet: 5 diamonds","bet5");
+                    button(41,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
+                    button(42,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
+                    button(43,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
+                    button(49,Items.LEVER,"DRAAI OPNIEUW - "+session.stake+" diamonds","spin");
+                }
             } else if(session.type.equals("roulette")) {
                 RouletteTable table=rouletteTables.computeIfAbsent(session.block,RouletteTable::new);
                 // The numbers are shown in actual clockwise European wheel order.
@@ -861,7 +879,10 @@ public final class CasinoCraft implements ModInitializer {
             try{s.stake=Integer.parseInt(action.substring(3));}catch(NumberFormatException ignored){return;}
             menu.refresh();return;
         }
-        if(s.type.equals("slots")&&action.equals("spin"))startSlotSpin(p,s);
+        if(s.type.equals("slots")) {
+            if(slotSpins.containsKey(p.getUUID())) return;
+            if(action.equals("spin"))startSlotSpin(p,s);
+        }
         if(s.type.equals("roulette")&&isRouletteChoice(action))placeTableBet(p,s,action);
         if(s.type.equals("horse")) {
             if(action.matches("horse[1-5]"))s.selected=Integer.parseInt(action.substring(5))-1;
@@ -876,6 +897,10 @@ public final class CasinoCraft implements ModInitializer {
         if(!debit(p,s.stake))return false;
         int[] symbols={random.nextInt(6),random.nextInt(6),random.nextInt(6)};
         slotSpins.put(p.getUUID(),new SlotSpin(p.getUUID(),s.stake,symbols));
+        s.lastSlotTitle = null;
+        s.lastSlotDetail = null;
+        CasinoMenu menu=openMenus.get(p.getUUID());
+        if(menu!=null && menu.session==s)menu.refresh();
         dirty=true;save();
         return true;
     }
@@ -903,13 +928,28 @@ public final class CasinoCraft implements ModInitializer {
                 ServerPlayer p=server.getPlayerList().getPlayer(spin.player);
                 if(p!=null) {
                     String combo=SLOT_LABELS[a[0]]+" / "+SLOT_LABELS[a[1]]+" / "+SLOT_LABELS[a[2]];
-                    if(menu!=null && menu.session.type.equals("slots"))
-                        showFinalResult(p,menu.session,earned>0?"SLOTS - GEWONNEN":"SLOTS - VERLOREN",
-                            combo+". "+(earned>0?"Uitbetaling: "+earned+" diamonds ("+multiplier+"x).":"Geen winnende combinatie."));
-                    else msg(p,"Slots: "+combo+". Uitbetaling: "+earned+" diamonds.");
+                    Session session=sessions.get(spin.player);
+                    if(session!=null && session.type.equals("slots")) {
+                        session.lastSlotSymbols=a.clone();
+                        session.lastSlotTitle=earned>0?"GEWONNEN!":"HELAAS, GEEN WINST";
+                        session.lastSlotDetail=earned>0?
+                            "Uitbetaling: "+earned+" diamonds ("+multiplier+"x), inzet "+spin.wager+"." :
+                            "Geen winnende combinatie. Verloren: "+spin.wager+" diamonds.";
+                        // Slots deliberately do NOT use the timed result screen or close the GUI.
+                        session.resultExpiresAt=-1;
+                    }
+                    msg(p,"Slots: "+combo+". "+(earned>0?"Gewonnen: "+earned+" diamonds.":"Geen winnende combinatie."));
+                } else {
+                    Session session=sessions.get(spin.player);
+                    if(session!=null && session.type.equals("slots")) {
+                        session.lastSlotSymbols=a.clone();
+                        session.lastSlotTitle=earned>0?"GEWONNEN!":"HELAAS, GEEN WINST";
+                        session.lastSlotDetail=earned>0?"Uitbetaling: "+earned+" diamonds ("+multiplier+"x).":
+                            "Geen winnende combinatie. Verloren: "+spin.wager+" diamonds.";
+                    }
                 }
                 slotSpins.remove(spin.player);dirty=true;save();
-                if(menu!=null)menu.refresh();
+                if(menu!=null && menu.session.type.equals("slots"))menu.refresh();
             }
         }
     }
