@@ -5,7 +5,17 @@
   "resultDisplaySeconds": 10,
   "title": "✦ ROULETTE ✦",
   "bettingText": "INZETTEN SLUITEN OVER {seconds}s",
-  "spinningText": "WIEL DRAAIT... {seconds}s",
+  "spinningText": "WIEL DRAAIT...",
   "resultText": "WINNAAR: {number} {color}",
-  "betsText": "{bets} inzetten geplaatst"
+  "betsText": "{bets} inzetten geplaatst",
+  "zeroWeight": 2,
+  "numberPayout": 36,
+  "zeroPayout": 18,
+  "outsidePayout": 2,
+  "groupPayout": 3,
+  "maxTotal": 256,
+  "maxChips": 64,
+  "redColor": 16733525,
+  "blackColor": 5592405,
+  "greenColor": 5635925
 }

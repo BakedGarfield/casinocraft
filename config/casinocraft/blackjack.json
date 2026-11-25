@@ -1,0 +1,5 @@
+{
+  "blackjackWinPayout": 2,
+  "blackjackTiePayout": 1,
+  "blackjackDealerStand": 17
+}

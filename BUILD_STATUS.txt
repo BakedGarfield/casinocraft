@@ -1,1 +1,1 @@
-CasinoCraft 26.3 alpha SOURCE ONLY. Roulette multiple simultaneous bets added (one wheel result; per-player ticket; debited on spin). Not compiled or gameplay-tested. Do not deploy on public SMP until Java 25 / Fabric API build, testing and crash-safe payout hardening.
+0.1.2-alpha: source update. Java syntax parsing and JSON/archive consistency checked. Full Fabric build and live server test not performed; use GitHub Actions (Java 25 / Gradle 9.8.0).

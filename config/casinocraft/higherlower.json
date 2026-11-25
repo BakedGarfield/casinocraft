@@ -1,0 +1,5 @@
+{
+  "higherLowerMinCorrect": 2,
+  "higherLowerCorrectPerStep": 2,
+  "higherLowerMaxPayout": 32
+}

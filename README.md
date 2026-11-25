@@ -156,3 +156,9 @@ This remains an uncompiled source build; validate the `entityTags()` mapping and
 
 ### Hoger of Lager cash-out beperking
 Diamonds innen kan pas na **twee juiste voorspellingen**. De GUI toont daarvoor een vergrendelde knop. Uitbetalingen: 2 juist = 2x, 4 juist = 3x, 6 juist = 4x, enzovoort.
+
+## Balance update 0.1.1-alpha
+See [BALANCE_UPDATE.md](BALANCE_UPDATE.md) for updated payouts, configuration and installation instructions. This supersedes older payout and roulette timing documentation.
+
+## Configuration and language (0.1.2-alpha)
+See [CONFIG_LANGUAGE.md](CONFIG_LANGUAGE.md) for individual game configuration, migration and custom language files.

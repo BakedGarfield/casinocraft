@@ -1,0 +1,13 @@
+{
+  "minStake": 1,
+  "maxStake": 64,
+  "resultSeconds": 5,
+  "enabledGames": [
+    "slots",
+    "blackjack",
+    "roulette",
+    "horse",
+    "higherlower"
+  ],
+  "language": "nl_nl"
+}

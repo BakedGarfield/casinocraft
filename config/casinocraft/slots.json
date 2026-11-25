@@ -1,0 +1,28 @@
+{
+  "slotWeights": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "slotThreePayout": [
+    12,
+    9,
+    7,
+    5,
+    4,
+    25
+  ],
+  "slotTwoPayout": [
+    2,
+    1,
+    1,
+    1,
+    1,
+    2
+  ],
+  "slotSpinTicks": 30,
+  "slotAnimationTicks": 3
+}

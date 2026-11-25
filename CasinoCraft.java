@@ -4,6 +4,7 @@ import com.google.gson.*;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -12,6 +13,7 @@ import net.minecraft.server.permissions.Permissions;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
@@ -68,6 +70,63 @@ public final class CasinoCraft implements ModInitializer {
     private final Map<String,String> blocks = new HashMap<>();
     private final Map<UUID,Session> sessions = new HashMap<>();
     private final Map<String,RouletteTable> rouletteTables = new HashMap<>();
+    private static final String ROULETTE_TAG = "casinocraft_roulette_hologram";
+    private RouletteConfig rouletteConfig = new RouletteConfig();
+    private boolean cleanedStartupDisplays;
+
+    /** Loaded from config/casinocraft/roulette.json on server startup. */
+    private static final class RouletteConfig {
+        int bettingSeconds = 30;
+        int minimumSpinSeconds = 15;
+        int maximumSpinSeconds = 30;
+        int zeroWeight = 2;
+        int numberPayout = 36, zeroPayout = 18, outsidePayout = 2, groupPayout = 3;
+        int maxTotal = 256, maxChips = 64;
+        int redColor = 0xFF5555, blackColor = 0x555555, greenColor = 0x55FF55;
+        int resultDisplaySeconds = 10;
+        String title = "✦ ROULETTE ✦";
+        String bettingText = "INZETTEN SLUITEN OVER {seconds}s";
+        String spinningText = "WIEL DRAAIT...";
+        String resultText = "WINNAAR: {number} {color}";
+        String betsText = "{bets} inzetten geplaatst";
+    }
+
+    private Path rouletteConfigPath() {
+        return FabricLoader.getInstance().getConfigDir().resolve("casinocraft").resolve("roulette.json");
+    }
+    private boolean loadRouletteConfig() {
+        Path path = rouletteConfigPath();
+        try {
+            Files.createDirectories(path.getParent());
+            Gson gson = new GsonBuilder().setPrettyPrinting().create();
+            if (!Files.exists(path)) Files.writeString(path, gson.toJson(new RouletteConfig()));
+            RouletteConfig loaded = gson.fromJson(Files.readString(path), RouletteConfig.class);
+            if (loaded == null) throw new IllegalArgumentException("empty config");
+            if (loaded.bettingSeconds < 5 || loaded.bettingSeconds > 600 ||
+                loaded.minimumSpinSeconds < 1 || loaded.maximumSpinSeconds > 30 ||
+                loaded.maximumSpinSeconds < loaded.minimumSpinSeconds ||
+                loaded.resultDisplaySeconds < 0 || loaded.resultDisplaySeconds > 600)
+                throw new IllegalArgumentException("invalid roulette times");
+            if (loaded.zeroWeight < 1 || loaded.zeroWeight > 100 || !validPayout(loaded.numberPayout) || !validPayout(loaded.zeroPayout) || !validPayout(loaded.outsidePayout) || !validPayout(loaded.groupPayout) || loaded.maxTotal < 1 || loaded.maxTotal > 4096 || loaded.maxChips < 1 || loaded.maxChips > 256 || !validColor(loaded.redColor) || !validColor(loaded.blackColor) || !validColor(loaded.greenColor))
+                throw new IllegalArgumentException("invalid roulette payout, odds, limit or color");
+            if (loaded.title == null || loaded.bettingText == null || loaded.spinningText == null ||
+                loaded.resultText == null || loaded.betsText == null)
+                throw new IllegalArgumentException("missing roulette text");
+            Files.writeString(path, gson.toJson(loaded));
+            rouletteConfig = loaded;
+            System.out.println("[CasinoCraft] Roulette config loaded: " + path);
+            return true;
+        } catch (Exception ex) {
+            System.err.println("[CasinoCraft] Invalid roulette config, keeping previous settings: " + ex);
+            return false;
+        }
+    }
+    private String rouletteText(String template, RouletteTable table, int seconds, int number) {
+        return template.replace("{seconds}", Integer.toString(seconds))
+            .replace("{bets}", Integer.toString(table.bets.size()))
+            .replace("{number}", Integer.toString(number))
+            .replace("{color}", number < 0 ? "" : tr(rouletteColor(number).toUpperCase(Locale.ROOT)));
+    }
     private final Map<UUID,SlotSpin> slotSpins = new HashMap<>();
     private final Map<UUID,CasinoMenu> openMenus = new HashMap<>();
     private final Map<UUID,Long> unpaid = new HashMap<>();
@@ -90,14 +149,15 @@ public final class CasinoCraft implements ModInitializer {
     private boolean dirty;
 
     private record RouletteChip(String choice, int amount) {}
-    private static final int MAX_ROULETTE_TOTAL = 256;
-    private static final int MAX_ROULETTE_CHIPS = 64;
+    
 
     private static final class Session {
         final String type;
         final String block;
         int stake = 1, selected = 0, value, dealer, rounds;
         String resultTitle, resultDetail;
+        int[] lastSlotSymbols;
+        String lastSlotTitle, lastSlotDetail;
         int resultExpiresAt = -1;
         boolean doubled;
         String roulettePage = "main";
@@ -109,9 +169,12 @@ public final class CasinoCraft implements ModInitializer {
     private static final class RouletteTable {
         final String block;
         final List<TableBet> bets = new ArrayList<>();
-        int seconds = -1;
+        int seconds = -1; // betting countdown; -1 during spin/idle
+        int spinSeconds = -1; // spinning countdown; -1 outside spin
+        int displayExpiresAt = -1; // server tick; -1 while display should stay
         int lastResult = -1;
         int wheelIndex = 0;
+        long phaseDeadline, nextAnimation;
         Display.TextDisplay display;
         RouletteTable(String block) { this.block=block; }
     }
@@ -124,8 +187,114 @@ public final class CasinoCraft implements ModInitializer {
     }
     private static final Item[] SLOT_ITEMS = {Items.DIAMOND,Items.EMERALD,Items.GOLD_INGOT,Items.REDSTONE,Items.AMETHYST_SHARD,Items.NETHER_STAR};
     private static final String[] SLOT_LABELS = {"Diamonds","Emeralds","Gold","Redstone","Amethyst","Nether Star"};
-    private static final int[] SLOT_THREE_MULT = {12,9,7,5,4,25};
-    private static final int[] SLOT_TWO_MULT = {3,2,2,1,1,5};
+    private GamesConfig games = new GamesConfig();
+    private static final class GamesConfig {
+        int minStake=1, maxStake=64, resultSeconds=5;
+        String[] enabledGames=TYPES.clone();
+        String language="nl_nl";
+        int[] slotWeights={1,1,1,1,1,1};
+        int[] slotThreePayout={12,9,7,5,4,25};
+        int[] slotTwoPayout={2,1,1,1,1,2};
+        int slotSpinTicks=30, slotAnimationTicks=3;
+        int blackjackWinPayout=2, blackjackTiePayout=1, blackjackDealerStand=17;
+        int higherLowerMinCorrect=2, higherLowerCorrectPerStep=2, higherLowerMaxPayout=32;
+        int horseBettingSeconds=60, horseRaceTicks=720;
+        int[] horseWeights=null, horsePayouts=null, horseArmorColors=null;
+    }
+    private static boolean validPayout(int n){return n>=1&&n<=100;}
+    private static boolean validColor(int n){return n>=0&&n<=0xFFFFFF;}
+    private static boolean validArray(int[] a,int length,int min,int max){return a!=null&&a.length==length&&Arrays.stream(a).allMatch(n->n>=min&&n<=max);}
+    private static final Map<String,List<String>> CONFIG_GROUPS = Map.of(
+        "general", List.of("minStake","maxStake","resultSeconds","enabledGames","language"),
+        "slots", List.of("slotWeights","slotThreePayout","slotTwoPayout","slotSpinTicks","slotAnimationTicks"),
+        "blackjack", List.of("blackjackWinPayout","blackjackTiePayout","blackjackDealerStand"),
+        "higherlower", List.of("higherLowerMinCorrect","higherLowerCorrectPerStep","higherLowerMaxPayout"),
+        "horse", List.of("horseBettingSeconds","horseRaceTicks","horseWeights","horsePayouts","horseArmorColors"));
+    private Map<String,String> language = Map.of();
+    private java.util.regex.Pattern languagePattern;
+    private JsonObject readObject(Path path) throws java.io.IOException {
+        return JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+    }
+    private JsonObject loadSplitConfig(Gson gson, Path legacy) throws java.io.IOException {
+        JsonObject merged=gson.toJsonTree(new GamesConfig()).getAsJsonObject();
+        if(Files.exists(legacy)) {
+            for(var e:readObject(legacy).entrySet()) if(merged.has(e.getKey())) merged.add(e.getKey(),e.getValue());
+        }
+        for(var group:CONFIG_GROUPS.entrySet()) {
+            Path path=legacy.resolveSibling(group.getKey()+".json");
+            if(!Files.exists(path)) {
+                JsonObject part=new JsonObject();
+                for(String key:group.getValue()) part.add(key,merged.get(key));
+                Files.writeString(path,gson.toJson(part));
+            }
+            JsonObject part=readObject(path);
+            for(String key:group.getValue()) if(part.has(key)) merged.add(key,part.get(key));
+        }
+        return merged;
+    }
+    private Map<String,String> readLanguage(String code, Gson gson) throws java.io.IOException {
+        if(code==null || !code.matches("[a-zA-Z0-9_-]{1,32}")) throw new IllegalArgumentException("invalid language name");
+        Path dir=rouletteConfigPath().resolveSibling("lang"); Files.createDirectories(dir);
+        JsonObject defaults;
+        try(var stream=CasinoCraft.class.getResourceAsStream("/casinocraft/nl_nl.json")) {
+            if(stream==null) throw new java.io.IOException("missing bundled language");
+            defaults=JsonParser.parseString(new String(stream.readAllBytes(),java.nio.charset.StandardCharsets.UTF_8)).getAsJsonObject();
+        }
+        Path base=dir.resolve("nl_nl.json");
+        if(!Files.exists(base)) Files.writeString(base,gson.toJson(defaults));
+        Path selected=dir.resolve(code+".json");
+        if(!Files.exists(selected)) Files.writeString(selected,gson.toJson(defaults));
+        JsonObject custom=readObject(selected);
+        Map<String,String> result=new HashMap<>();
+        for(var e:custom.entrySet()) {
+            if(e.getKey().isBlank() || !e.getValue().isJsonPrimitive() || !e.getValue().getAsJsonPrimitive().isString()) throw new IllegalArgumentException("invalid language entry");
+            String translated=e.getValue().getAsString();
+            if(!e.getKey().equals(translated)) result.put(e.getKey(),translated);
+        }
+        return result;
+    }
+    private void setLanguage(Map<String,String> translations) {
+        language=translations;
+        languagePattern=translations.isEmpty()?null:java.util.regex.Pattern.compile(translations.keySet().stream()
+            .sorted(Comparator.comparingInt(String::length).reversed().thenComparing(Comparator.naturalOrder()))
+            .map(key -> (Character.isLetterOrDigit(key.charAt(0))?"(?<![\\p{L}\\p{N}_])":"")+java.util.regex.Pattern.quote(key)+(Character.isLetterOrDigit(key.charAt(key.length()-1))?"(?![\\p{L}\\p{N}_])":""))
+            .collect(java.util.stream.Collectors.joining("|")));
+    }
+    private String tr(String text) {
+        if(text==null || languagePattern==null)return text;
+        return languagePattern.matcher(text).replaceAll(m -> java.util.regex.Matcher.quoteReplacement(language.get(m.group())));
+    }
+    private boolean loadGamesConfig() {
+        Path path=rouletteConfigPath().resolveSibling("games.json");
+        try {
+            Files.createDirectories(path.getParent());
+            Gson gson=new GsonBuilder().serializeNulls().setPrettyPrinting().create();
+            GamesConfig c=gson.fromJson(loadSplitConfig(gson,path),GamesConfig.class);
+            if(c==null || c.minStake<1 || c.maxStake<c.minStake || c.maxStake>64 || c.resultSeconds<1 || c.resultSeconds>60 || c.enabledGames==null || !Arrays.asList(TYPES).containsAll(Arrays.asList(c.enabledGames)) ||
+                !validArray(c.slotWeights,6,1,1000)||!validArray(c.slotThreePayout,6,0,100)||!validArray(c.slotTwoPayout,6,0,100)||c.slotSpinTicks<3||c.slotSpinTicks>1200||c.slotAnimationTicks<1||c.slotAnimationTicks>c.slotSpinTicks||
+                !validPayout(c.blackjackWinPayout)||!validPayout(c.blackjackTiePayout)||c.blackjackDealerStand<1||c.blackjackDealerStand>21||c.higherLowerMinCorrect<2||c.higherLowerMinCorrect>100||c.higherLowerCorrectPerStep<1||c.higherLowerCorrectPerStep>100||!validPayout(c.higherLowerMaxPayout)||c.horseBettingSeconds<1||c.horseBettingSeconds>600||c.horseRaceTicks<20||c.horseRaceTicks>12000||
+                (c.horseWeights!=null&&(!validArray(c.horseWeights,5,0,100)||Arrays.stream(c.horseWeights).sum()!=100))||(c.horsePayouts!=null&&!validArray(c.horsePayouts,5,1,100))||(c.horseArmorColors!=null&&!validArray(c.horseArmorColors,5,0,0xFFFFFF)))throw new IllegalArgumentException("invalid games config");
+            Map<String,String> nextLanguage=readLanguage(c.language,gson);
+            setLanguage(nextLanguage);
+            games=c;
+            if(c.horseWeights!=null)System.arraycopy(c.horseWeights,0,weights,0,5);
+            if(c.horsePayouts!=null)System.arraycopy(c.horsePayouts,0,multipliers,0,5);
+            if(c.horseArmorColors!=null)System.arraycopy(c.horseArmorColors,0,horseColors,0,5);
+            return true;
+        }catch(Exception e){System.err.println("[CasinoCraft] Invalid games config, keeping previous settings: "+e);return false;}
+    }
+    private int slotSymbol(){int n=random.nextInt(Arrays.stream(games.slotWeights).sum());for(int i=0;i<6;i++){n-=games.slotWeights[i];if(n<0)return i;}return 5;}
+    private boolean enabled(String type){return Arrays.asList(games.enabledGames).contains(type);}
+    private boolean stakeAllowed(int amount){return amount>=games.minStake&&amount<=games.maxStake;}
+    private int reloadConfig(){
+        if(server==null || !bets.isEmpty() || raceTicks>=0 || countdown>=0 || !slotSpins.isEmpty() || rouletteTables.values().stream().anyMatch(t->!t.bets.isEmpty()) || sessions.values().stream().anyMatch(s->s.rounds>0))return 0;
+        GamesConfig previous=games; Map<String,String> previousLanguage=language; RouletteConfig previousRoulette=rouletteConfig; int[] oldWeights=weights.clone(),oldPayouts=multipliers.clone(),oldColors=horseColors.clone();
+        if(!loadGamesConfig())return 0;
+        if(!loadRouletteConfig()){games=previous;setLanguage(previousLanguage);rouletteConfig=previousRoulette;System.arraycopy(oldWeights,0,weights,0,5);System.arraycopy(oldPayouts,0,multipliers,0,5);System.arraycopy(oldColors,0,horseColors,0,5);return 0;}
+        for(Session s:sessions.values())if(!stakeAllowed(s.stake))s.stake=games.minStake;
+        for(CasinoMenu m:openMenus.values())m.refresh();
+        return 1;
+    }
 
 
     @Override public void onInitialize() {
@@ -133,8 +302,10 @@ public final class CasinoCraft implements ModInitializer {
             dispatcher.register(Commands.literal("casinoplay")
                 .then(Commands.argument("action", StringArgumentType.word())
                     .executes(ctx -> action(ctx.getSource().getPlayerOrException(), StringArgumentType.getString(ctx,"action")))));
+            dispatcher.register(Commands.literal("casinocraft").requires(src -> src.permissions().hasPermission(Permissions.COMMANDS_MODERATOR)).then(Commands.literal("reload").executes(ctx -> reloadConfig())));
             dispatcher.register(Commands.literal("casino")
                 .requires(src -> src.permissions().hasPermission(Permissions.COMMANDS_MODERATOR))
+                .then(Commands.literal("reload").executes(ctx -> reloadConfig()))
                 .then(Commands.literal("block")
                     .then(Commands.literal("set").then(Commands.argument("game", StringArgumentType.word())
                         .executes(ctx -> registerBlock(ctx.getSource().getPlayerOrException(),StringArgumentType.getString(ctx,"game")))))
@@ -164,20 +335,32 @@ public final class CasinoCraft implements ModInitializer {
             String pos = key(world.dimension().identifier().toString(),hit.getBlockPos());
             String type = blocks.get(pos);
             if (type==null) return InteractionResult.PASS;
+            if(!enabled(type)){msg(sp,"Dit spel is uitgeschakeld.");return InteractionResult.SUCCESS;}
+            Session prior=sessions.get(sp.getUUID());
+            if(prior!=null&&prior.rounds>0){msg(sp,"Rond eerst je actieve kaartspel af.");if(prior.block.equals(pos))openCasinoGui(sp,prior);return InteractionResult.SUCCESS;}
             Session session = new Session(type,pos);
+            session.stake=games.minStake;
             sessions.put(sp.getUUID(),session);
             openCasinoGui(sp,session);
             return InteractionResult.SUCCESS;
         });
         ServerTickEvents.END_SERVER_TICK.register(s -> {
-            if (server == null) { server=s; load(); }
+            if (server == null) { server=s; loadRouletteConfig(); load(); loadGamesConfig(); }
             tick++;
             if (tick % 20 == 0) second();
             if (raceTicks >= 0) stepRace();
             updateSlotSpins();
             updateResultScreens();
-            if (tick % 4 == 0) animateRouletteText();
-            if (tick % 20 == 0) updateRouletteTables();
+            updateRouletteTables();
+            animateRouletteText();
+            if (tick == 40 && !cleanedStartupDisplays) {
+                cleanedStartupDisplays = true;
+                for (var entry : blocks.entrySet())
+                    if (entry.getValue().equals("roulette")) { RouletteTable t=rouletteTables.get(entry.getKey()); cleanupRouletteDisplays(entry.getKey(),t==null?null:t.display); }
+            }
+            if (tick % 20 == 0) {
+                expireRouletteDisplays();
+            }
             if (tick % 200 == 0 && dirty) save();
         });
     }
@@ -186,7 +369,7 @@ public final class CasinoCraft implements ModInitializer {
     private void showFinalResult(ServerPlayer p, Session s, String title, String detail) {
         s.resultTitle = title;
         s.resultDetail = detail;
-        s.resultExpiresAt = tick + 100;
+        s.resultExpiresAt = tick + games.resultSeconds*20;
         CasinoMenu menu = openMenus.get(p.getUUID());
         if (menu != null && menu.session == s) menu.refresh();
         msg(p, title + " - " + detail);
@@ -286,18 +469,18 @@ public final class CasinoCraft implements ModInitializer {
         countdown=1;msg(p,"Race start over 1 seconde.");return 1;
     }
     private boolean validChances(){return Arrays.stream(weights).sum()==100;}
-    private void msg(ServerPlayer p,String text){p.sendSystemMessage(Component.literal("[CasinoCraft] "+text));}
+    private void msg(ServerPlayer p,String text){p.sendSystemMessage(Component.literal("[CasinoCraft] "+tr(text)));}
     private void link(ServerPlayer p,String title,String action) {
-        p.sendSystemMessage(Component.literal("[ "+title+" ]").withStyle(s ->
+        p.sendSystemMessage(Component.literal("[ "+tr(title)+" ]").withStyle(s ->
             s.withColor(0xF5C842).withClickEvent(new ClickEvent.RunCommand("/casinoplay "+action))));
     }
     private void horseLink(ServerPlayer p,int i) {
         String description="Paard "+(i+1)+": "+NAMES[i]+" ["+colorHex(i)+"] | "+weights[i]+"% winstkans | "+multipliers[i]+"x";
-        p.sendSystemMessage(Component.literal("[ "+description+" ]").withStyle(style ->
+        p.sendSystemMessage(Component.literal("[ "+tr(description)+" ]").withStyle(style ->
             style.withColor(horseColors[i]).withClickEvent(new ClickEvent.RunCommand("/casinoplay horse"+(i+1)))));
     }
     private boolean available(ServerPlayer p,Session s) {
-        if(s==null)return false;
+        if(s==null||!enabled(s.type))return false;
         String stored=blocks.get(s.block);
         if(!s.type.equals(stored))return false;
         String[] parts=s.block.split("\\|");
@@ -312,7 +495,7 @@ public final class CasinoCraft implements ModInitializer {
             for(int i=0;i<5;i++)horseLink(p,i);
             msg(p,"Gekozen: "+NAMES[s.selected]+". Nieuwe inzetten sluiten bij de start.");
         } else if(s.type.equals("blackjack") && s.rounds>0){msg(p,"Jouw score: "+s.value+" | dealer zichtbaar: "+s.dealer);link(p,"Hit","hit");link(p,"Stand","stand");return;
-        } else if(s.type.equals("higherlower") && s.rounds>0){msg(p,"Huidige kaart: "+s.value+" | reeks: "+s.rounds);link(p,"Hoger","higher");link(p,"Lager","lower");link(p,"Innemen","cashout");return;}
+        } else if(s.type.equals("higherlower") && s.rounds>0){msg(p,"Huidige kaart: "+s.value+" | juist: "+(s.rounds-1)+" | prijs: "+higherLowerMultiplier(s)+"x");link(p,"Hoger","higher");link(p,"Lager","lower");if(s.rounds-1>=games.higherLowerMinCorrect)link(p,"Innemen","cashout");else msg(p,"Innemen pas mogelijk na "+games.higherLowerMinCorrect+" juiste voorspellingen (nog "+(games.higherLowerMinCorrect-(s.rounds-1))+" nodig).");return;}
         else if(s.type.equals("roulette")){
             showRoulette(p,s);
         }
@@ -325,8 +508,8 @@ public final class CasinoCraft implements ModInitializer {
     private int action(ServerPlayer p,String a) {
         Session s=sessions.get(p.getUUID());
         if(!available(p,s)){msg(p,"Klik eerst op een geregistreerd casinoblok en blijf erbij.");return 0;}
-        if(a.startsWith("bet") && s.rounds==0) {
-            try {int n=Integer.parseInt(a.substring(3)); if(n<1||n>64)return 0;s.stake=n;show(p,s);return 1;} catch(NumberFormatException ignored){return 0;}
+        if(a.startsWith("bet") && s.rounds==0 && !slotSpins.containsKey(p.getUUID())) {
+            try {int n=Integer.parseInt(a.substring(3)); if(!stakeAllowed(n))return 0;s.stake=n;show(p,s);return 1;} catch(NumberFormatException ignored){return 0;}
         }
         if(s.type.equals("horse")) {
             if(a.matches("horse[1-5]")){s.selected=Integer.parseInt(a.substring(5))-1;show(p,s);return 1;}
@@ -337,13 +520,13 @@ public final class CasinoCraft implements ModInitializer {
             if(a.equals("rmain") || a.equals("rdozens") || a.equals("rcolumns") || a.equals("rnumbers1") || a.equals("rnumbers2") || a.equals("rnumbers3")) {
                 s.roulettePage=a.substring(1);show(p,s);return 1;
             }
-            if(a.equals("rspin")) return spinRoulette(p,s);
+            if(a.equals("rspin")){msg(p,"Roulette draait automatisch na de inzetperiode.");return 1;}
             if(a.equals("rclear")) { s.rouletteChips.clear(); show(p,s); return 1; }
             if(a.equals("rundo")) {
                 if(!s.rouletteChips.isEmpty())s.rouletteChips.remove(s.rouletteChips.size()-1);
                 show(p,s);return 1;
             }
-            if(isRouletteChoice(a)) return addRouletteChip(p,s,a);
+            if(isRouletteChoice(a)){placeTableBet(p,s,a);return 1;}
         }
         if(s.type.equals("blackjack"))return blackjack(p,s,a);
         if(s.type.equals("higherlower"))return higherlower(p,s,a);
@@ -384,12 +567,13 @@ public final class CasinoCraft implements ModInitializer {
         dirty=true;
     }
     private int placeBet(ServerPlayer p,Session s){
+        if(!stakeAllowed(s.stake)){msg(p,"Inzet buiten toegestane limieten.");return 0;}
         if(raceTicks>=0){msg(p,"Race is bezig. Wacht op de volgende.");return 0;}
         if(trackCenter==null){msg(p,"Admin moet eerst /casino horse center instellen.");return 0;}
         if(!validChances()){msg(p,"Admin moet eerst kansen instellen tot 100%.");return 0;}
-        if(!debit(p,s.stake))return 0;
+        if(!stakeAllowed(s.stake)||!debit(p,s.stake))return 0;
         bets.add(new Bet(p.getUUID(),s.selected,s.stake,multipliers[s.selected]));
-        if(countdown<0)countdown=60;
+        if(countdown<0)countdown=games.horseBettingSeconds;
         dirty=true;msg(p,"Inzet bevestigd: "+s.stake+" diamonds op "+NAMES[s.selected]+". Start over "+countdown+"s.");return 1;
     }
     private int slots(ServerPlayer p,Session s){
@@ -399,44 +583,49 @@ public final class CasinoCraft implements ModInitializer {
     private void showRoulette(ServerPlayer p,Session s) {
         switch(s.roulettePage) {
             case "dozens" -> {
-                link(p,"1e dozijn: 1-12 (3x)","rdozen1");
-                link(p,"2e dozijn: 13-24 (3x)","rdozen2");
-                link(p,"3e dozijn: 25-36 (3x)","rdozen3");
+                link(p,"1e dozijn: 1-12 ("+rouletteConfig.groupPayout+"x)","rdozen1");
+                link(p,"2e dozijn: 13-24 ("+rouletteConfig.groupPayout+"x)","rdozen2");
+                link(p,"3e dozijn: 25-36 ("+rouletteConfig.groupPayout+"x)","rdozen3");
             }
             case "columns" -> {
-                link(p,"Kolom 1: 1,4,7,...,34 (3x)","rcolumn1");
-                link(p,"Kolom 2: 2,5,8,...,35 (3x)","rcolumn2");
-                link(p,"Kolom 3: 3,6,9,...,36 (3x)","rcolumn3");
+                link(p,"Kolom 1: 1,4,7,...,34 ("+rouletteConfig.groupPayout+"x)","rcolumn1");
+                link(p,"Kolom 2: 2,5,8,...,35 ("+rouletteConfig.groupPayout+"x)","rcolumn2");
+                link(p,"Kolom 3: 3,6,9,...,36 ("+rouletteConfig.groupPayout+"x)","rcolumn3");
             }
             case "numbers1", "numbers2", "numbers3" -> {
                 int page=Integer.parseInt(s.roulettePage.substring(7));
                 int from=page==1?0:page==2?13:25;
                 int to=page==1?12:page==2?24:36;
-                msg(p,"Kies een nummer (0-36). Uitbetaling: 36x inclusief inzet.");
-                for(int n=from;n<=to;n++)link(p,"Nummer "+n+" ("+rouletteColor(n)+")","rn"+n);
+                msg(p,"Kies een nummer (0-36). Uitbetaling: "+rouletteConfig.numberPayout+"x; nul: "+rouletteConfig.zeroPayout+"x inclusief inzet.");
+                for(int n=from;n<=to;n++)link(p,"Nummer "+n+" ("+rouletteColor(n)+", "+(n==0?rouletteConfig.zeroPayout:rouletteConfig.numberPayout)+"x)","rn"+n);
                 link(p,"Nummers 0-12","rnumbers1");
                 link(p,"Nummers 13-24","rnumbers2");
                 link(p,"Nummers 25-36","rnumbers3");
             }
             default -> {
-                link(p,"Rood (2x)","rred");link(p,"Zwart (2x)","rblack");
-                link(p,"Even (2x)","reven");link(p,"Oneven (2x)","rodd");
-                link(p,"Laag: 1-18 (2x)","rlow");link(p,"Hoog: 19-36 (2x)","rhigh");
-                link(p,"Nul / groen (36x)","rn0");
-                link(p,"Drie dozijnen (3x)","rdozens");
-                link(p,"Drie kolommen (3x)","rcolumns");
-                link(p,"Afzonderlijke nummers (36x)","rnumbers1");
+                link(p,"Rood ("+rouletteConfig.outsidePayout+"x)","rred");link(p,"Zwart ("+rouletteConfig.outsidePayout+"x)","rblack");
+                link(p,"Even ("+rouletteConfig.outsidePayout+"x)","reven");link(p,"Oneven ("+rouletteConfig.outsidePayout+"x)","rodd");
+                link(p,"Laag: 1-18 ("+rouletteConfig.outsidePayout+"x)","rlow");link(p,"Hoog: 19-36 ("+rouletteConfig.outsidePayout+"x)","rhigh");
+                link(p,"Nul / groen ("+rouletteConfig.zeroPayout+"x)","rn0");
+                link(p,"Drie dozijnen ("+rouletteConfig.groupPayout+"x)","rdozens");
+                link(p,"Drie kolommen ("+rouletteConfig.groupPayout+"x)","rcolumns");
+                link(p,"Afzonderlijke nummers ("+rouletteConfig.numberPayout+"x)","rnumbers1");
             }
         }
         if(!s.roulettePage.equals("main"))link(p,"Terug naar roulette-overzicht","rmain");
         int total=rouletteTotal(s);
-        msg(p,"Roulettekaart: "+s.rouletteChips.size()+" inzet(ten), totaal "+total+" diamonds (max "+MAX_ROULETTE_TOTAL+").");
+        msg(p,"Roulettekaart: "+s.rouletteChips.size()+" inzet(ten), totaal "+total+" diamonds (max "+rouletteConfig.maxTotal+").");
         for(RouletteChip chip:s.rouletteChips)msg(p," • "+rouletteLabel(chip.choice())+": "+chip.amount()+" diamond(s)");
         msg(p,"Kies een inzetvak om "+s.stake+" diamond(s) toe te voegen. Alles draait samen op één nummer.");
         link(p,"DRAAI ROULETTE ("+total+" diamonds)","rspin");
         link(p,"Laatste inzet verwijderen","rundo");
         link(p,"Alle inzetten wissen","rclear");
     }
+    private int rouletteWinner() {
+        int n=random.nextInt(36+rouletteConfig.zeroWeight);
+        return n<rouletteConfig.zeroWeight?0:n-rouletteConfig.zeroWeight+1;
+    }
+    private int rouletteRgb(int n) { return n==0?rouletteConfig.greenColor:RED_NUMBERS.contains(n)?rouletteConfig.redColor:rouletteConfig.blackColor; }
     private String rouletteColor(int n) {
         return n==0?"groen":RED_NUMBERS.contains(n)?"rood":"zwart";
     }
@@ -449,17 +638,17 @@ public final class CasinoCraft implements ModInitializer {
     // Return the total payout, including the original stake. Zero loses on all outside bets.
     private int rouletteMultiplier(String choice,int n) {
         if(choice.startsWith("rn") && choice.substring(2).matches("[0-9]+"))
-            return n==Integer.parseInt(choice.substring(2))?36:0;
+            return n==Integer.parseInt(choice.substring(2))?(n==0?rouletteConfig.zeroPayout:rouletteConfig.numberPayout):0;
         if(n==0)return 0;
         return switch(choice) {
-            case "rred" -> RED_NUMBERS.contains(n)?2:0;
-            case "rblack" -> !RED_NUMBERS.contains(n)?2:0;
-            case "reven" -> n%2==0?2:0;
-            case "rodd" -> n%2!=0?2:0;
-            case "rlow" -> n<=18?2:0;
-            case "rhigh" -> n>=19?2:0;
-            case "rdozen1","rdozen2","rdozen3" -> (n-1)/12==Integer.parseInt(choice.substring(6))-1?3:0;
-            case "rcolumn1","rcolumn2","rcolumn3" -> (n-1)%3==Integer.parseInt(choice.substring(7))-1?3:0;
+            case "rred" -> RED_NUMBERS.contains(n)?rouletteConfig.outsidePayout:0;
+            case "rblack" -> !RED_NUMBERS.contains(n)?rouletteConfig.outsidePayout:0;
+            case "reven" -> n%2==0?rouletteConfig.outsidePayout:0;
+            case "rodd" -> n%2!=0?rouletteConfig.outsidePayout:0;
+            case "rlow" -> n<=18?rouletteConfig.outsidePayout:0;
+            case "rhigh" -> n>=19?rouletteConfig.outsidePayout:0;
+            case "rdozen1","rdozen2","rdozen3" -> (n-1)/12==Integer.parseInt(choice.substring(6))-1?rouletteConfig.groupPayout:0;
+            case "rcolumn1","rcolumn2","rcolumn3" -> (n-1)%3==Integer.parseInt(choice.substring(7))-1?rouletteConfig.groupPayout:0;
             default -> 0;
         };
     }
@@ -483,8 +672,8 @@ public final class CasinoCraft implements ModInitializer {
     // Selecting a betting field only queues a chip: inventory is debited once at spin time.
     private int addRouletteChip(ServerPlayer p, Session s, String choice) {
         if(!isRouletteChoice(choice))return 0;
-        if(s.rouletteChips.size()>=MAX_ROULETTE_CHIPS || rouletteTotal(s)+s.stake>MAX_ROULETTE_TOTAL){
-            msg(p,"Maximaal "+MAX_ROULETTE_CHIPS+" inzetten en "+MAX_ROULETTE_TOTAL+" diamonds per draai.");return 0;
+        if(s.rouletteChips.size()>=rouletteConfig.maxChips || rouletteTotal(s)+s.stake>rouletteConfig.maxTotal){
+            msg(p,"Maximaal "+rouletteConfig.maxChips+" inzetten en "+rouletteConfig.maxTotal+" diamonds per draai.");return 0;
         }
         s.rouletteChips.add(new RouletteChip(choice,s.stake));
         msg(p,"Toegevoegd: "+s.stake+" diamonds op "+rouletteLabel(choice)+".");
@@ -494,7 +683,7 @@ public final class CasinoCraft implements ModInitializer {
         int total=rouletteTotal(s);
         if(total<=0){msg(p,"Kies eerst minstens één inzetvak.");return 0;}
         if(!debit(p,total))return 0;
-        int number=random.nextInt(37);
+        int number=rouletteWinner();
         long payout=0;
         for(RouletteChip chip:s.rouletteChips) {
             long earned=(long)chip.amount()*rouletteMultiplier(chip.choice(),number);
@@ -509,7 +698,7 @@ public final class CasinoCraft implements ModInitializer {
     private int blackjack(ServerPlayer p,Session s,String a){
         if (s.resultExpiresAt >= 0) return 0;
         if(a.equals("deal")&&s.rounds==0){
-            if(!debit(p,s.stake))return 0;
+            if(!stakeAllowed(s.stake)||!debit(p,s.stake))return 0;
             s.value=card()+card();s.dealer=card();s.rounds=1;show(p,s);return 1;
         }
         if(s.rounds==0)return 0;
@@ -522,8 +711,8 @@ public final class CasinoCraft implements ModInitializer {
             return 1;
         }
         if(a.equals("stand")){
-            int dealer=s.dealer+card();while(dealer<17)dealer+=card();
-            int mult=(dealer>21||s.value>dealer)?2:(s.value==dealer?1:0);
+            int dealer=s.dealer+card();while(dealer<games.blackjackDealerStand)dealer+=card();
+            int mult=(dealer>21||s.value>dealer)?games.blackjackWinPayout:(s.value==dealer?games.blackjackTiePayout:0);
             long earned=(long)s.stake*mult;
             credit(p.getUUID(),earned);
             s.rounds=0;
@@ -537,12 +726,23 @@ public final class CasinoCraft implements ModInitializer {
         }return 0;
     }
     private int card(){return Math.min(10,random.nextInt(13)+1);}
+    // The opening card does not count as a correct prediction.
+    // 0-1 correct: 1x, 2-3 correct: 2x, 4-5 correct: 3x, etc.
+    private int higherLowerMultiplier(Session session) {
+        int correctGuesses = Math.max(0, session.rounds - 1);
+        return Math.min(games.higherLowerMaxPayout, 1 + correctGuesses / games.higherLowerCorrectPerStep);
+    }
     private int higherlower(ServerPlayer p,Session s,String a){
         if (s.resultExpiresAt >= 0) return 0;
-        if(a.equals("deal")&&s.rounds==0){if(!debit(p,s.stake))return 0;s.value=random.nextInt(13)+1;s.rounds=1;show(p,s);return 1;}
+        if(a.equals("deal")&&s.rounds==0){if(!stakeAllowed(s.stake)||!debit(p,s.stake))return 0;s.value=random.nextInt(13)+1;s.rounds=1;show(p,s);return 1;}
         if(s.rounds==0)return 0;
         if(a.equals("cashout")){
-            long prize=(long)s.stake*Math.min(32,1L<<Math.min(5,s.rounds-1));
+            // Never allow early payouts, including direct or stale menu clicks.
+            if (s.rounds - 1 < games.higherLowerMinCorrect) {
+                msg(p,"Je moet eerst "+games.higherLowerMinCorrect+" keer juist raden voordat je diamonds kunt innen.");
+                return 0;
+            }
+            long prize=(long)s.stake*higherLowerMultiplier(s);
             credit(p.getUUID(),prize);s.rounds=0;
             showFinalResult(p,s,"UITBETAALD", "Je hebt op tijd gestopt en "+prize+" diamonds ontvangen.");
             return 1;
@@ -630,7 +830,7 @@ public final class CasinoCraft implements ModInitializer {
                 ItemStack coloredArmor = new ItemStack(Items.LEATHER_HORSE_ARMOR);
                 coloredArmor.set(DataComponents.DYED_COLOR, new DyedItemColor(horseColors[i]));
                 horse.setItemSlot(EquipmentSlot.BODY, coloredArmor);
-                horse.setCustomName(Component.literal(NAMES[i]).withColor(horseColors[i]));horse.setCustomNameVisible(true);
+                horse.setCustomName(Component.literal(tr(NAMES[i])).withColor(horseColors[i]));horse.setCustomNameVisible(true);
                 double[] xy=oval(i,0);horse.setPos(xy[0],horseGroundY(level,xy[0],xy[1]),xy[1]);orientHorse(horse,i,0);level.addFreshEntity(horse);runners.add(horse);}
         }
         notifyHorsePlayers("🐎 Race begonnen! Vijf paarden zijn vertrokken.");dirty=true;
@@ -670,7 +870,7 @@ public final class CasinoCraft implements ModInitializer {
         // All five horses traverse their full oval with consistent distance interpolation.
         // The weighted winner arrives first, while the others remain in a close race.
         for (int i = 0; i < 5; i++) {
-            int finishTicks = i == chosenWinner ? 720 : 755 + i * 13;
+            int finishTicks = i == chosenWinner ? games.horseRaceTicks : games.horseRaceTicks + 35 + i * 13;
             double progress = Math.min(1.0, (double)raceTicks / finishTicks);
             raceProgress[i] = progress;
             if (i < runners.size()) {
@@ -706,7 +906,7 @@ public final class CasinoCraft implements ModInitializer {
             openMenus.put(p.getUUID(),menu);
             menu.refresh();
             return menu;
-        }, Component.literal("CasinoCraft - "+switch(s.type){case "horse" -> "Paardenrace"; case "blackjack" -> "Blackjack"; case "higherlower" -> "Hoger of Lager"; case "roulette" -> "Roulette"; default -> "Slots";})));
+        }, Component.literal("CasinoCraft - "+tr(switch(s.type){case "horse" -> "Paardenrace"; case "blackjack" -> "Blackjack"; case "higherlower" -> "Hoger of Lager"; case "roulette" -> "Roulette"; default -> "Slots";}))));
     }
     private final class CasinoMenu extends ChestMenu {
         final Session session;
@@ -722,11 +922,12 @@ public final class CasinoCraft implements ModInitializer {
             this.session=session;this.viewer=viewer;this.virtual=inventory;
         }
         void button(int slot,Item item,String title,String action){
+            if(action.matches("bet[0-9]+")){int amount=Integer.parseInt(action.substring(3)); if(amount==1)amount=games.minStake;else if(amount==64)amount=games.maxStake; if(!stakeAllowed(amount))return; title="Inzet: "+amount+" diamonds";action="bet"+amount;}
             buttonStack(slot,new ItemStack(item),title,action);
         }
         void buttonStack(int slot,ItemStack stack,String title,String action){
             actions.put(slot,action);
-            stack.set(DataComponents.CUSTOM_NAME,Component.literal(title));
+            stack.set(DataComponents.CUSTOM_NAME,Component.literal(tr(title)));
             virtual.setItem(slot,stack);
         }
         void refresh() {
@@ -743,34 +944,51 @@ public final class CasinoCraft implements ModInitializer {
                 return;
             }
             if(session.type.equals("slots")) {
-                button(10,Items.PAPER,"3 gelijk: Diamond 12x | Emerald 9x | Gold 7x","noop");
-                button(11,Items.PAPER,"Redstone 5x | Amethyst 4x | Nether Star 25x","noop");
-                button(12,Items.PAPER,"2 gelijk: symbolen betalen 1-5x","noop");
-                int[] reel=slotSpins.containsKey(viewer)?slotSpins.get(viewer).symbols:new int[]{0,2,1};
+                SlotSpin activeSpin = slotSpins.get(viewer);
+                button(10,Items.PAPER,"3 gelijk: Diamond "+games.slotThreePayout[0]+"x | Emerald "+games.slotThreePayout[1]+"x | Gold "+games.slotThreePayout[2]+"x","noop");
+                button(11,Items.PAPER,"Redstone "+games.slotThreePayout[3]+"x | Amethyst "+games.slotThreePayout[4]+"x | Nether Star "+games.slotThreePayout[5]+"x","noop");
+                button(12,Items.PAPER,"2 gelijk (Diamond, Emerald, Gold, Redstone, Amethyst, Star): "+Arrays.toString(games.slotTwoPayout)+"x","noop");
+                // Keep the last THREE actual outcomes visible after a spin until the next spin starts.
+                int[] reel = activeSpin != null ? new int[]{random.nextInt(6),random.nextInt(6),random.nextInt(6)} :
+                    (session.lastSlotSymbols != null ? session.lastSlotSymbols : new int[]{0,2,1});
                 for(int i=0;i<3;i++)button(21+i,SLOT_ITEMS[reel[i]],"Rol "+(i+1)+": "+SLOT_LABELS[reel[i]],"noop");
-                button(39,Blocks.WOOL.red().asItem(),"Inzet: 1 diamond","bet1");
-                button(40,Items.GOLD_INGOT,"Inzet: 5 diamonds","bet5");
-                button(41,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
-                button(42,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
-                button(43,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
-                button(49,Items.LEVER,"DRAAI - "+session.stake+" diamonds","spin");
+                if (activeSpin != null) {
+                    button(31,Items.CLOCK,"ROLLEN DRAAIEN...","noop");
+                    button(49,Items.CLOCK,"WACHT TOT DE ROLLEN STOPPEN","noop");
+                } else {
+                    if (session.lastSlotTitle != null) {
+                        button(30,Items.BOOK,session.lastSlotTitle,"noop");
+                        button(31,session.lastSlotDetail != null && session.lastSlotDetail.startsWith("Uitbetaling:")
+                            ? Items.DIAMOND : Items.BARRIER,
+                            session.lastSlotDetail == null ? "" : session.lastSlotDetail,"noop");
+                    } else {
+                        button(31,Items.BOOK,"Kies je inzet en draai!","noop");
+                    }
+                    button(39,Blocks.WOOL.red().asItem(),"Inzet: 1 diamond","bet1");
+                    button(40,Items.GOLD_INGOT,"Inzet: 5 diamonds","bet5");
+                    button(41,Items.DIAMOND,"Inzet: 10 diamonds","bet10");
+                    button(42,Items.DIAMOND_BLOCK,"Inzet: 32 diamonds","bet32");
+                    button(43,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
+                    button(49,Items.LEVER,"DRAAI OPNIEUW - "+session.stake+" diamonds","spin");
+                }
             } else if(session.type.equals("roulette")) {
                 RouletteTable table=rouletteTables.computeIfAbsent(session.block,RouletteTable::new);
                 // The numbers are shown in actual clockwise European wheel order.
-                int from=page==0?0:19, to=page==0?19:EUROPEAN_WHEEL.length;
+                int from=page==0?0:18, to=page==0?18:EUROPEAN_WHEEL.length;
                 for(int index=from;index<to;index++) {
                     int n=EUROPEAN_WHEEL[index];
-                    int slot=index-from;
+                    int slot=index-from==18?34:index-from;
                     button(slot,n==0?Items.EMERALD_BLOCK:RED_NUMBERS.contains(n)?Blocks.WOOL.red().asItem():Blocks.WOOL.black().asItem(),
-                        "Wielpositie "+(index+1)+": "+n+" ("+rouletteColor(n)+", 36x)","rn"+n);
+                        "Wielpositie "+(index+1)+": "+n+" ("+rouletteColor(n)+", "+(n==0?rouletteConfig.zeroPayout:rouletteConfig.numberPayout)+"x)","rn"+n);
                 }
-                button(18,Blocks.WOOL.red().asItem(),"ROOD - 2x","rred");button(19,Blocks.WOOL.black().asItem(),"ZWART - 2x","rblack");
-                button(20,Items.IRON_INGOT,"EVEN - 2x","reven");button(21,Items.GOLD_INGOT,"ONEVEN - 2x","rodd");
-                button(22,Items.SLIME_BALL,"1-18 - 2x","rlow");button(23,Items.LAPIS_LAZULI,"19-36 - 2x","rhigh");
-                button(24,Items.PAPER,"Dozijn 1 (3x)","rdozen1");button(25,Items.PAPER,"Dozijn 2 (3x)","rdozen2");button(26,Items.PAPER,"Dozijn 3 (3x)","rdozen3");
-                button(27,Items.PAPER,"Kolom 1 (3x)","rcolumn1");button(28,Items.PAPER,"Kolom 2 (3x)","rcolumn2");button(29,Items.PAPER,"Kolom 3 (3x)","rcolumn3");
+                button(18,Blocks.WOOL.red().asItem(),"ROOD - "+rouletteConfig.outsidePayout+"x","rred");button(19,Blocks.WOOL.black().asItem(),"ZWART - "+rouletteConfig.outsidePayout+"x","rblack");
+                button(20,Items.IRON_INGOT,"EVEN - "+rouletteConfig.outsidePayout+"x","reven");button(21,Items.GOLD_INGOT,"ONEVEN - "+rouletteConfig.outsidePayout+"x","rodd");
+                button(22,Items.SLIME_BALL,"1-18 - "+rouletteConfig.outsidePayout+"x","rlow");button(23,Items.LAPIS_LAZULI,"19-36 - "+rouletteConfig.outsidePayout+"x","rhigh");
+                button(24,Items.PAPER,"Dozijn 1 ("+rouletteConfig.groupPayout+"x)","rdozen1");button(25,Items.PAPER,"Dozijn 2 ("+rouletteConfig.groupPayout+"x)","rdozen2");button(26,Items.PAPER,"Dozijn 3 ("+rouletteConfig.groupPayout+"x)","rdozen3");
+                button(27,Items.PAPER,"Kolom 1 ("+rouletteConfig.groupPayout+"x)","rcolumn1");button(28,Items.PAPER,"Kolom 2 ("+rouletteConfig.groupPayout+"x)","rcolumn2");button(29,Items.PAPER,"Kolom 3 ("+rouletteConfig.groupPayout+"x)","rcolumn3");
                 button(30,Items.ARROW,page==0?"Volgende wielhelft":"Vorige wielhelft","page");
-                button(32,Items.CLOCK,table.seconds<0?"Wacht op eerste inzet":("Sluit over "+table.seconds+" sec"),"noop");
+                button(32,Items.CLOCK,table.spinSeconds>0 ? "Wiel draait..." :
+                    table.seconds<0 ? "Wacht op eerste inzet" : ("Inzetten sluiten over " + table.seconds + " sec"), "noop");
                 int sum=0;for(TableBet b:table.bets)if(b.player.equals(viewer))sum+=b.amount;
                 button(33,Items.BOOK,"Jouw geplaatste inzetten: "+sum+" diamonds","noop");
                 button(38,Items.GOLD_NUGGET,"Inzet: 1 diamond","bet1");
@@ -780,6 +998,7 @@ public final class CasinoCraft implements ModInitializer {
                 button(42,Items.EMERALD_BLOCK,"Inzet: 64 diamonds","bet64");
                 button(49,Blocks.CONCRETE.green().asItem(),"Klik inzetvak om "+session.stake+" diamonds te plaatsen","noop");
                 button(50,Items.CLOCK,"Volgende ronde automatisch","noop");
+                button(35,Items.PAPER,"Nul: "+rouletteConfig.zeroWeight+"/"+(36+rouletteConfig.zeroWeight)+" | Overige nummers elk 1/"+(36+rouletteConfig.zeroWeight),"noop");
             } else if(session.type.equals("horse")) {
                 button(4,Items.SADDLE,"PAARDENRACE - Kies een paard","noop");
                 for(int i=0;i<5;i++) {
@@ -814,13 +1033,17 @@ public final class CasinoCraft implements ModInitializer {
                     button(49,Blocks.CONCRETE.lime().asItem(),"DEEL KAARTEN - "+session.stake+" diamonds","deal");
                 }
             } else if(session.type.equals("higherlower")) {
-                button(4,Items.BOOK,"HOGER OF LAGER - Raad de volgende kaart","noop");
+                button(4,Items.BOOK,"HOGER OF LAGER - iedere "+games.higherLowerCorrectPerStep+" juiste gokken +1x","noop");
                 if(session.rounds>0) {
-                    button(22,Items.PAPER,"Huidige kaart: "+session.value+" | reeks: "+session.rounds,"noop");
+                    button(22,Items.PAPER,"Kaart: "+session.value+" | Juist: "+(session.rounds-1)+" | Uitbetaling: "+higherLowerMultiplier(session)+"x","noop");
                     button(38,Blocks.CONCRETE.lime().asItem(),"HOGER","higher");
                     button(40,Blocks.CONCRETE.red().asItem(),"LAGER","lower");
-                    long prize=(long)session.stake*Math.min(32,1L<<Math.min(5,session.rounds-1));
-                    button(42,Items.DIAMOND,"INNEN - "+prize+" diamonds","cashout");
+                    long prize=(long)session.stake*higherLowerMultiplier(session);
+                    if (session.rounds - 1 >= games.higherLowerMinCorrect) {
+                        button(42,Items.DIAMOND,"INNEN - "+prize+" diamonds","cashout");
+                    } else {
+                        button(42,Items.BARRIER,"INNEN VERGRENDELD - nog "+(games.higherLowerMinCorrect-(session.rounds-1))+" juist nodig","noop");
+                    }
                 } else {
                     button(22,Items.PAPER,"Begin een nieuw spel","noop");
                     button(38,Items.GOLD_NUGGET,"Inzet 1 diamond","bet1");
@@ -857,11 +1080,16 @@ public final class CasinoCraft implements ModInitializer {
             return;
         }
         if(action.equals("page")){menu.page=1-menu.page;menu.refresh();return;}
+        if(!available(p,s))return;
         if(action.startsWith("bet")){
-            try{s.stake=Integer.parseInt(action.substring(3));}catch(NumberFormatException ignored){return;}
+            if(s.rounds>0||slotSpins.containsKey(p.getUUID()))return;
+            try{int n=Integer.parseInt(action.substring(3));if(!stakeAllowed(n)){msg(p,"Inzet buiten toegestane limieten.");return;}s.stake=n;}catch(NumberFormatException ignored){return;}
             menu.refresh();return;
         }
-        if(s.type.equals("slots")&&action.equals("spin"))startSlotSpin(p,s);
+        if(s.type.equals("slots")) {
+            if(slotSpins.containsKey(p.getUUID())) return;
+            if(action.equals("spin"))startSlotSpin(p,s);
+        }
         if(s.type.equals("roulette")&&isRouletteChoice(action))placeTableBet(p,s,action);
         if(s.type.equals("horse")) {
             if(action.matches("horse[1-5]"))s.selected=Integer.parseInt(action.substring(5))-1;
@@ -872,10 +1100,15 @@ public final class CasinoCraft implements ModInitializer {
         menu.refresh();
     }
     private boolean startSlotSpin(ServerPlayer p,Session s) {
+        if(!stakeAllowed(s.stake)){msg(p,"Inzet buiten toegestane limieten.");return false;}
         if(slotSpins.containsKey(p.getUUID())){msg(p,"De rollen draaien nog.");return false;}
         if(!debit(p,s.stake))return false;
-        int[] symbols={random.nextInt(6),random.nextInt(6),random.nextInt(6)};
+        int[] symbols={slotSymbol(),slotSymbol(),slotSymbol()};
         slotSpins.put(p.getUUID(),new SlotSpin(p.getUUID(),s.stake,symbols));
+        s.lastSlotTitle = null;
+        s.lastSlotDetail = null;
+        CasinoMenu menu=openMenus.get(p.getUUID());
+        if(menu!=null && menu.session==s)menu.refresh();
         dirty=true;save();
         return true;
     }
@@ -884,45 +1117,61 @@ public final class CasinoCraft implements ModInitializer {
         for(SlotSpin spin:new ArrayList<>(slotSpins.values())) {
             spin.ticks++;
             CasinoMenu menu=openMenus.get(spin.player);
-            if(spin.ticks%3==0&&menu!=null&&menu.session.type.equals("slots")) {
+            if(spin.ticks%games.slotAnimationTicks==0&&menu!=null&&menu.session.type.equals("slots")) {
                 // Animate visually while retaining the already-chosen server-side outcome.
                 for(int i=0;i<3;i++) {
-                    int reel=(spin.ticks>=30)?spin.symbols[i]:random.nextInt(6);
+                    int reel=(spin.ticks>=games.slotSpinTicks)?spin.symbols[i]:random.nextInt(6);
                     menu.button(21+i,SLOT_ITEMS[reel],"Rol "+(i+1)+": "+SLOT_LABELS[reel],"noop");
                 }
                 menu.broadcastChanges();
             }
-            if(spin.ticks>=30) {
+            if(spin.ticks>=games.slotSpinTicks) {
                 int[] a=spin.symbols;
                 int multiplier;
-                if(a[0]==a[1]&&a[1]==a[2])multiplier=SLOT_THREE_MULT[a[0]];
-                else if(a[0]==a[1]||a[0]==a[2]||a[1]==a[2])multiplier=SLOT_TWO_MULT[a[0]==a[1]||a[0]==a[2]?a[0]:a[1]];
+                if(a[0]==a[1]&&a[1]==a[2])multiplier=games.slotThreePayout[a[0]];
+                else if(a[0]==a[1]||a[0]==a[2]||a[1]==a[2])multiplier=games.slotTwoPayout[a[0]==a[1]||a[0]==a[2]?a[0]:a[1]];
                 else multiplier=0;
                 long earned=(long)spin.wager*multiplier;
                 credit(spin.player,earned);
                 ServerPlayer p=server.getPlayerList().getPlayer(spin.player);
                 if(p!=null) {
                     String combo=SLOT_LABELS[a[0]]+" / "+SLOT_LABELS[a[1]]+" / "+SLOT_LABELS[a[2]];
-                    if(menu!=null && menu.session.type.equals("slots"))
-                        showFinalResult(p,menu.session,earned>0?"SLOTS - GEWONNEN":"SLOTS - VERLOREN",
-                            combo+". "+(earned>0?"Uitbetaling: "+earned+" diamonds ("+multiplier+"x).":"Geen winnende combinatie."));
-                    else msg(p,"Slots: "+combo+". Uitbetaling: "+earned+" diamonds.");
+                    Session session=sessions.get(spin.player);
+                    if(session!=null && session.type.equals("slots")) {
+                        session.lastSlotSymbols=a.clone();
+                        session.lastSlotTitle=earned>spin.wager?"GEWONNEN!":earned==spin.wager?"INZET TERUG":"HELAAS, GEEN WINST";
+                        session.lastSlotDetail=earned>0?
+                            "Uitbetaling: "+earned+" diamonds ("+multiplier+"x), inzet "+spin.wager+"." :
+                            "Geen winnende combinatie. Verloren: "+spin.wager+" diamonds.";
+                        // Slots deliberately do NOT use the timed result screen or close the GUI.
+                        session.resultExpiresAt=-1;
+                    }
+                    msg(p,"Slots: "+combo+". "+(earned>spin.wager?"Gewonnen: "+earned+" diamonds.":earned==spin.wager?"Inzet terug: "+earned+" diamonds.":"Geen winnende combinatie."));
+                } else {
+                    Session session=sessions.get(spin.player);
+                    if(session!=null && session.type.equals("slots")) {
+                        session.lastSlotSymbols=a.clone();
+                        session.lastSlotTitle=earned>spin.wager?"GEWONNEN!":earned==spin.wager?"INZET TERUG":"HELAAS, GEEN WINST";
+                        session.lastSlotDetail=earned>0?"Uitbetaling: "+earned+" diamonds ("+multiplier+"x).":
+                            "Geen winnende combinatie. Verloren: "+spin.wager+" diamonds.";
+                    }
                 }
                 slotSpins.remove(spin.player);dirty=true;save();
-                if(menu!=null)menu.refresh();
+                if(menu!=null && menu.session.type.equals("slots"))menu.refresh();
             }
         }
     }
     private void placeTableBet(ServerPlayer p,Session s,String choice) {
+        if(!stakeAllowed(s.stake)){msg(p,"Inzet buiten toegestane limieten.");return ;}
         RouletteTable table=rouletteTables.computeIfAbsent(s.block,RouletteTable::new);
-        if(table.seconds==0){msg(p,"Wacht tot de volgende ronde.");return;}
+        if(table.spinSeconds>=0 || table.seconds==0){msg(p,"Het wiel draait al. Wacht tot de volgende ronde.");return;}
         int individual=0, count=0;
         for(TableBet b:table.bets)if(b.player.equals(p.getUUID())){individual+=b.amount;count++;}
-        if(individual+s.stake>MAX_ROULETTE_TOTAL||count>=MAX_ROULETTE_CHIPS){msg(p,"Maximum 256 diamonds en 64 inzetten per speler per ronde.");return;}
+        if(individual+s.stake>rouletteConfig.maxTotal||count>=rouletteConfig.maxChips){msg(p,"Maximum "+rouletteConfig.maxTotal+" diamonds en "+rouletteConfig.maxChips+" inzetten per speler per ronde.");return;}
         if(!debit(p,s.stake))return;
         table.bets.add(new TableBet(p.getUUID(),choice,s.stake));
-        if(table.seconds<0){table.seconds=10;table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);}
-        updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
+        if(table.seconds<0){table.seconds=rouletteConfig.bettingSeconds;table.phaseDeadline=System.nanoTime()+table.seconds*1_000_000_000L;table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);table.displayExpiresAt=-1;}
+        updateFloatingLabel(table,rouletteText(tr(rouletteConfig.bettingText),table,table.seconds,-1));
         dirty=true;save();
         msg(p,"Ingezet: "+s.stake+" diamonds op "+rouletteLabel(choice)+". Nog "+table.seconds+" seconden.");
         refreshTableMenus(s.block);
@@ -931,46 +1180,109 @@ public final class CasinoCraft implements ModInitializer {
         for(CasinoMenu m:new ArrayList<>(openMenus.values()))if(m.session.type.equals("roulette")&&m.session.block.equals(block))m.refresh();
     }
     private void animateRouletteText() {
-        for(RouletteTable table:rouletteTables.values())if(table.seconds>0&&table.seconds<=5) {
+        long now=System.nanoTime();
+        for (RouletteTable table : rouletteTables.values()) if (table.spinSeconds > 0 && now>=table.nextAnimation) {
             table.wheelIndex=(table.wheelIndex+1)%EUROPEAN_WHEEL.length;
-            updateFloatingResult(table,EUROPEAN_WHEEL[table.wheelIndex]);
+            table.nextAnimation=now+(table.spinSeconds<=3?450:table.spinSeconds<=6?250:100)*1_000_000L;
+            updateFloatingSpin(table);
         }
     }
     private void updateRouletteTables() {
-        for(RouletteTable table:new ArrayList<>(rouletteTables.values())) {
-            if(table.seconds>0) {table.seconds--;
-                if(table.seconds>5)updateFloatingLabel(table,"DRAAIT OVER "+table.seconds+"s");
-                refreshTableMenus(table.block);
-            }
-            if(table.seconds==0) {
-                table.seconds=-1;
-                int winner=random.nextInt(37);
-                table.lastResult=winner;
-                updateFloatingResult(table,winner);
-                Map<UUID,Long> rewards=new HashMap<>();
-                Map<UUID,Integer> stakes=new HashMap<>();
-                for(TableBet b:table.bets) {
-                    rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
-                    stakes.merge(b.player,b.amount,Integer::sum);
-                }
-                // Record unpaid credits before leaving the round.
-                for(var e:rewards.entrySet())if(e.getValue()>0)unpaid.merge(e.getKey(),e.getValue(),Long::sum);
-                table.bets.clear();dirty=true;save();
-                for(UUID id:rewards.keySet()){
-                    deliver(id);ServerPlayer p=server.getPlayerList().getPlayer(id);
-                    if(p!=null) {
-                        Session playerSession=sessions.get(id);
-                        long paid=rewards.get(id);
-                        String detail="Nummer "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+"). " +
-                            (paid==0 ? "Geen van jouw inzetten won." : "Jouw winnende inzetten betaalden "+paid+" diamonds uit.") +
-                            " Inzet: "+stakes.getOrDefault(id,0)+" diamonds.";
-                        if(playerSession!=null && playerSession.type.equals("roulette") && playerSession.block.equals(table.block))
-                            showFinalResult(p,playerSession,paid==0?"ROULETTE - VERLOREN":"ROULETTE - UITSLAG",detail);
-                        else msg(p,"Roulette: "+detail);
-                    }
+        long now=System.nanoTime();
+        for (RouletteTable table : new ArrayList<>(rouletteTables.values())) {
+            if (table.seconds > 0) {
+                int remaining=(int)Math.max(0,(table.phaseDeadline-now+999_999_999L)/1_000_000_000L);
+                if (remaining==table.seconds) continue;
+                table.seconds=remaining;
+                if (remaining>0) updateFloatingLabel(table,rouletteText(tr(rouletteConfig.bettingText),table,remaining,-1));
+                else {
+                    table.seconds=-1;
+                    table.spinSeconds=rouletteConfig.minimumSpinSeconds+random.nextInt(rouletteConfig.maximumSpinSeconds-rouletteConfig.minimumSpinSeconds+1);
+                    table.phaseDeadline=now+table.spinSeconds*1_000_000_000L;
+                    table.nextAnimation=now;
+                    table.wheelIndex=random.nextInt(EUROPEAN_WHEEL.length);
+                    updateFloatingSpin(table);
                 }
                 refreshTableMenus(table.block);
+            } else if (table.spinSeconds > 0) {
+                int remaining=(int)Math.max(0,(table.phaseDeadline-now+999_999_999L)/1_000_000_000L);
+                if(remaining==table.spinSeconds) continue;
+                table.spinSeconds=remaining;
+                if(remaining>0) updateFloatingSpin(table);
+                else {table.spinSeconds=-1; settleRoulette(table);}
+                refreshTableMenus(table.block);
             }
+        }
+    }
+    private void updateFloatingSpin(RouletteTable table) {
+        Display.TextDisplay display=getRouletteDisplay(table);
+        if(display==null)return;
+        int n=EUROPEAN_WHEEL[table.wheelIndex];
+        display.setText(Component.literal(tr(rouletteConfig.title)+"\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+            .append(Component.literal(rouletteText(tr(rouletteConfig.spinningText).replace("{seconds}s", "").replace("{seconds}", "").strip(),table,0,n)+"\n").withStyle(ChatFormatting.YELLOW))
+            .append(Component.literal(tr(n+" "+rouletteColor(n).toUpperCase(Locale.ROOT))+"\n").withColor(rouletteRgb(n)).withStyle(ChatFormatting.BOLD))
+            .append(Component.literal(rouletteText(tr(rouletteConfig.betsText),table,0,n)).withStyle(ChatFormatting.GRAY)));
+    }
+    private void settleRoulette(RouletteTable table) {
+        // One randomly sampled number shared by all players at this registered table.
+        int winner = rouletteWinner();
+        table.lastResult = winner;
+        updateFloatingResult(table,winner);
+        table.displayExpiresAt = tick + rouletteConfig.resultDisplaySeconds * 20;
+        Map<UUID,Long> rewards = new HashMap<>();
+        Map<UUID,Integer> stakes = new HashMap<>();
+        for (TableBet b : table.bets) {
+            rewards.merge(b.player,(long)b.amount*rouletteMultiplier(b.choice,winner),Long::sum);
+            stakes.merge(b.player,b.amount,Integer::sum);
+        }
+        // Persist pending payouts BEFORE delivering them, then clear settled wagers.
+        for (var e : rewards.entrySet()) if(e.getValue()>0) unpaid.merge(e.getKey(),e.getValue(),Long::sum);
+        table.bets.clear(); dirty=true; save();
+        for (UUID id : rewards.keySet()) {
+            deliver(id);
+            ServerPlayer player=server.getPlayerList().getPlayer(id);
+            if(player != null) {
+                player.sendSystemMessage(Component.literal("[CasinoCraft] "+tr("Winnende roulette: ")).withStyle(ChatFormatting.WHITE).append(Component.literal(tr(winner+" "+rouletteColor(winner).toUpperCase(Locale.ROOT))).withColor(rouletteRgb(winner)).withStyle(ChatFormatting.BOLD)));
+                Session playerSession=sessions.get(id);
+                long paid=rewards.get(id);
+                String detail="Nummer "+winner+" ("+rouletteColor(winner).toUpperCase(Locale.ROOT)+"). " +
+                    (paid==0 ? "Geen van jouw inzetten won." : "Jouw winnende inzetten betaalden "+paid+" diamonds uit.") +
+                    " Inzet: "+stakes.getOrDefault(id,0)+" diamonds.";
+                if(playerSession!=null && playerSession.type.equals("roulette") && playerSession.block.equals(table.block))
+                    showFinalResult(player,playerSession,paid==0?"ROULETTE - VERLOREN":"ROULETTE - UITSLAG",detail);
+                else msg(player,"Roulette: "+detail);
+            }
+        }
+        refreshTableMenus(table.block);
+    }
+    private void expireRouletteDisplays() {
+        for (RouletteTable table : rouletteTables.values()) {
+            if (table.displayExpiresAt>=0 && tick>=table.displayExpiresAt && table.seconds<0 && table.spinSeconds<0) {
+                if (table.display != null && table.display.isAlive()) table.display.discard();
+                table.display=null;
+                table.displayExpiresAt=-1;
+            }
+        }
+    }
+    /** Remove old CasinoCraft roulette displays at this registered table, not arbitrary holograms elsewhere. */
+    private void cleanupRouletteDisplays(String block, Display.TextDisplay keep) {
+        String[] pieces=block.split("\\|");
+        if (pieces.length!=2) return;
+        ServerLevel level=null;
+        for (ServerLevel l:server.getAllLevels())
+            if(l.dimension().identifier().toString().equals(pieces[0])) {level=l;break;}
+        if(level==null) return;
+        try {
+            String[] xyz=pieces[1].split(",");
+            BlockPos at=new BlockPos(Integer.parseInt(xyz[0]),Integer.parseInt(xyz[1]),Integer.parseInt(xyz[2]));
+            AABB area=new AABB(at).inflate(2.5);
+            for (Display.TextDisplay display : level.getEntitiesOfClass(Display.TextDisplay.class,area,
+                e -> e != keep && (e.entityTags().contains(ROULETTE_TAG) ||
+                    e.getText().getString().toUpperCase(Locale.ROOT).contains("ROULETTE")))) {
+                display.discard();
+            }
+        } catch (Exception e) {
+            System.err.println("[CasinoCraft] Could not cleanup old roulette displays at " + block + ": " + e);
         }
     }
     private Display.TextDisplay getRouletteDisplay(RouletteTable table) {
@@ -984,10 +1296,14 @@ public final class CasinoCraft implements ModInitializer {
         String[] coords=pieces[1].split(",");
         if(coords.length!=3)return null;
         BlockPos at=new BlockPos(Integer.parseInt(coords[0]),Integer.parseInt(coords[1]),Integer.parseInt(coords[2]));
+        // When the old display reference is gone (including after a restart), clean up
+        // legacy roulette text displays within the small area of this registered block.
+        cleanupRouletteDisplays(table.block,null);
         table.display=EntityTypes.TEXT_DISPLAY.create(level,EntitySpawnReason.COMMAND);
         if(table.display==null)return null;
         table.display.setPos(at.getX()+0.5,at.getY()+1.85,at.getZ()+0.5);
         table.display.setNoGravity(true);
+        table.display.addTag(ROULETTE_TAG);
         // Each vanilla client renders the billboard facing its OWN viewpoint.
         table.display.setBillboardConstraints(Display.BillboardConstraints.CENTER);
         table.display.setLineWidth(240);
@@ -999,22 +1315,29 @@ public final class CasinoCraft implements ModInitializer {
     private void updateFloatingResult(RouletteTable table,int winner) {
         Display.TextDisplay display=getRouletteDisplay(table);
         if(display==null)return;
-        ChatFormatting color = winner==0 ? ChatFormatting.GREEN :
-            RED_NUMBERS.contains(winner) ? ChatFormatting.RED : ChatFormatting.GRAY;
-        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
-            .append(Component.literal("WINNAAR: ").withStyle(ChatFormatting.WHITE))
-            .append(Component.literal(winner+"  "+rouletteColor(winner).toUpperCase(Locale.ROOT)).withStyle(color,ChatFormatting.BOLD)));
+        String template=tr(rouletteConfig.resultText);
+        var line=Component.literal("");
+        java.util.regex.Matcher matcher=java.util.regex.Pattern.compile("\\{number\\}|\\{color\\}").matcher(template);
+        int pos=0;
+        while(matcher.find()) {
+            line.append(Component.literal(rouletteText(template.substring(pos,matcher.start()),table,0,winner)).withStyle(ChatFormatting.WHITE));
+            line.append(Component.literal(rouletteText(matcher.group(),table,0,winner)).withColor(rouletteRgb(winner)).withStyle(ChatFormatting.BOLD));
+            pos=matcher.end();
+        }
+        line.append(Component.literal(rouletteText(template.substring(pos),table,0,winner)).withStyle(ChatFormatting.WHITE));
+        display.setText(Component.literal(tr(rouletteConfig.title)+"\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD).append(line));
     }
     private void updateFloatingLabel(RouletteTable table,String value) {
         Display.TextDisplay display=getRouletteDisplay(table);
         if(display==null)return;
-        display.setText(Component.literal("✦ ROULETTE ✦\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
+        display.setText(Component.literal(tr(rouletteConfig.title)+"\n").withStyle(ChatFormatting.GOLD,ChatFormatting.BOLD)
             .append(Component.literal(value+"\n").withStyle(ChatFormatting.YELLOW))
-            .append(Component.literal(table.bets.size()+" inzet(ten) geplaatst").withStyle(ChatFormatting.GRAY)));
+            .append(Component.literal(rouletteText(tr(rouletteConfig.betsText),table,0,-1)).withStyle(ChatFormatting.GRAY)));
     }
     private void clearTable(String key) {
         RouletteTable table=rouletteTables.remove(key);
         if(table!=null&&table.display!=null&&table.display.isAlive())table.display.discard();
+        cleanupRouletteDisplays(key,null);
     }
     private Path path(){return server.getWorldPath(LevelResource.ROOT).resolve("casinocraft.json");}
     private void load(){
